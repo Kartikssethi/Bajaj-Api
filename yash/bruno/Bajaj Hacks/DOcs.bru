@@ -1,0 +1,29 @@
+meta {
+  name: DOcs
+  type: http
+  seq: 1
+}
+
+post {
+  url: http://localhost:3000/hackrx/run
+  body: json
+  auth: inherit
+}
+
+headers {
+  Content-Type: application/json
+  Authorization: Bearer d2616659a7fd02e3f14cae15e7660eac6d24581d4e9f5dcecd8ac5cf55db138a
+}
+
+body:json {
+  {
+    "documents": "https://hackrx.blob.core.windows.net/assets/policy.pdf",
+    "questions": [
+      "What is the grace period for premium payment?"
+    ]
+  }
+}
+
+settings {
+  encodeUrl: false
+}
