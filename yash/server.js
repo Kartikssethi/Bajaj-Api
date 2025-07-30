@@ -18,10 +18,15 @@ require("dotenv").config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Create logs directory if it doesn't exist
+// Create logs and faiss-stores directories if they don't exist
 const logsDir = path.join(__dirname, "logs");
 if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
+}
+
+const faissStoresDir = path.join(__dirname, "faiss-stores");
+if (!fs.existsSync(faissStoresDir)) {
+  fs.mkdirSync(faissStoresDir, { recursive: true });
 }
 
 // Configure Winston logger
@@ -49,21 +54,9 @@ const logger = winston.createLogger({
       maxSize: "20m",
       maxFiles: "14d",
     }),
-    // HackRX specific logs
-    new winston.transports.DailyRotateFile({
-      filename: path.join(logsDir, "hackrx-%DATE%.log"),
-      datePattern: "YYYY-MM-DD",
-      maxSize: "20m",
-      maxFiles: "30d",
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.printf(({ timestamp, level, message, ...meta }) => {
-          return `${timestamp} [${level.toUpperCase()}]: ${message} ${
-            Object.keys(meta).length ? JSON.stringify(meta, null, 2) : ""
-          }`;
-        })
-      ),
-    }),
+    // HackRX specific logs (now with dynamic filename for request details)
+    // The "hackrx" transport will be created dynamically per request in the /hackrx/run route
+    // to allow logging request/response bodies separately.
   ],
 });
 
@@ -123,8 +116,10 @@ app.use(express.urlencoded({ extended: true }));
 // Request logging middleware
 app.use((req, res, next) => {
   const startTime = Date.now();
-  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  
+  const requestId = `req_${Date.now()}_${Math.random()
+    .toString(36)
+    .substr(2, 9)}`;
+
   req.requestId = requestId;
   req.startTime = startTime;
 
@@ -166,16 +161,16 @@ const embeddings = new GoogleGenerativeAIEmbeddings({
   model: "text-embedding-004", // Latest embedding model
 });
 
-// Store for FAISS instances (in production, use Redis or database)
+// Store for FAISS instances (in-memory cache for currently active stores)
+// This supplements the disk persistence
 const vectorStores = new Map();
 
 // Cache configuration
-const CACHE_TTL = 3600; // 1 hour in seconds
-const EMBEDDING_CACHE_TTL = 86400; // 24 hours for embeddings
+const CACHE_TTL = 3600; // 1 hour in seconds for answers and URL content
+// EMBEDDING_CACHE_TTL is less relevant now as FAISS stores are directly persisted
 
 class DocumentProcessor {
   constructor() {
-    // Optimized for speed - smaller chunks, less overlap
     this.textSplitter = new RecursiveCharacterTextSplitter({
       chunkSize: 600, // Smaller chunks for faster processing
       chunkOverlap: 50, // Minimal overlap for speed
@@ -185,7 +180,7 @@ class DocumentProcessor {
   async extractTextFromFile(filePath, fileType) {
     try {
       logger.info("Extracting text from file", { filePath, fileType });
-      
+
       if (fileType === "application/pdf") {
         const dataBuffer = fs.readFileSync(filePath);
         const data = await pdfParse(dataBuffer);
@@ -202,29 +197,33 @@ class DocumentProcessor {
         throw new Error(`Unsupported file type: ${fileType}`);
       }
     } catch (error) {
-      logger.error("Error extracting text from file", { 
-        filePath, 
-        fileType, 
-        error: error.message 
+      logger.error("Error extracting text from file", {
+        filePath,
+        fileType,
+        error: error.message,
       });
       throw new Error(`Error extracting text: ${error.message}`);
     }
   }
 
-  async downloadAndExtractFromUrl(url) {
+  async downloadAndExtractFromUrl(url, requestId) {
     try {
-      logger.info("Downloading document from URL", { url });
-      
-      // Check Redis cache first
+      logger.info("Downloading document from URL", { url, requestId });
+
+      // Check Redis cache for content first
       const cacheKey = `url_content:${Buffer.from(url).toString("base64")}`;
+      let cachedContent;
       try {
-        const cachedContent = await redisClient.get(cacheKey);
+        cachedContent = await redisClient.get(cacheKey);
         if (cachedContent) {
-          logger.info("Found cached content for URL", { url });
+          logger.info("Found cached content for URL", { url, requestId });
           return cachedContent;
         }
       } catch (redisError) {
-        logger.warn("Redis cache check failed", { error: redisError.message });
+        logger.warn("Redis cache check for URL content failed", {
+          error: redisError.message,
+          requestId,
+        });
       }
 
       const response = await axios.get(url, {
@@ -241,30 +240,59 @@ class DocumentProcessor {
       }
 
       const tempFilePath = path.join(tempDir, `temp_${Date.now()}.pdf`);
-      fs.writeFileSync(tempFilePath, response.data);
+      // Infer file extension from content-type header if possible
+      let fileExtension = ".pdf"; // Default to PDF
+      if (
+        contentType.includes("application/msword") ||
+        contentType.includes(
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+      ) {
+        fileExtension = ".docx";
+      } else if (contentType.includes("text/plain")) {
+        fileExtension = ".txt";
+      }
+      const finalTempFilePath = path.join(
+        tempDir,
+        `temp_${Date.now()}${fileExtension}`
+      );
 
-      logger.info("Extracting text from downloaded document");
+      fs.writeFileSync(finalTempFilePath, response.data);
+
+      logger.info("Extracting text from downloaded document", {
+        requestId,
+        finalTempFilePath,
+        contentType,
+      });
       const text = await this.extractTextFromFile(
-        tempFilePath,
-        "application/pdf"
+        finalTempFilePath,
+        contentType // Use actual content type for extraction
       );
 
       // Clean up temp file immediately
-      fs.unlinkSync(tempFilePath);
+      fs.unlinkSync(finalTempFilePath);
 
       // Cache the extracted text
       try {
         await redisClient.setEx(cacheKey, CACHE_TTL, text);
-        logger.info("Cached extracted text", { url, textLength: text.length });
+        logger.info("Cached extracted text from URL", {
+          url,
+          textLength: text.length,
+          requestId,
+        });
       } catch (redisError) {
-        logger.warn("Failed to cache extracted text", { error: redisError.message });
+        logger.warn("Failed to cache extracted text from URL", {
+          error: redisError.message,
+          requestId,
+        });
       }
 
       return text;
     } catch (error) {
-      logger.error("Error downloading and extracting from URL", { 
-        url, 
-        error: error.message 
+      logger.error("Error downloading and extracting from URL", {
+        url,
+        error: error.message,
+        requestId,
       });
       throw new Error(
         `Error downloading and extracting from URL: ${error.message}`
@@ -272,108 +300,131 @@ class DocumentProcessor {
     }
   }
 
-  async processAndStoreDocument(documentSource, storeId, requestId) {
+  // documentSource can be:
+  // 1. A local file path (from /upload endpoint)
+  // 2. A URL (from /hackrx/run endpoint or directly in /upload if you support URL upload there)
+  // 3. Raw text content (from /hackrx/run endpoint)
+  async processAndStoreDocument(documentSource, requestId, fileType = null) {
     try {
       let text;
+      let actualFileType = fileType; // Use provided fileType for uploads
 
-      logger.info("Processing document", { documentSource: documentSource.substring(0, 100), storeId, requestId });
-      
-      // Check if documentSource is URL or file path
+      logger.info("Processing document source", {
+        documentSource: documentSource.substring(0, 100),
+        requestId,
+        initialFileTypeHint: fileType,
+      });
+
       if (documentSource.startsWith("http")) {
-        text = await this.downloadAndExtractFromUrl(documentSource);
+        // If it's a URL, download and extract
+        text = await this.downloadAndExtractFromUrl(documentSource, requestId);
+        // For URL, we already extracted to text, so fileType becomes irrelevant
+        // or can be considered 'text/plain' conceptually.
+      } else if (actualFileType) {
+        // This branch is explicitly for file uploads (e.g., from /upload)
+        // where documentSource is a file path on the server's temp directory
+        // and fileType is the actual MIME type of the uploaded file.
+        text = await this.extractTextFromFile(documentSource, actualFileType);
       } else {
-        // Assume it's a file path
-        text = await this.extractTextFromFile(
-          documentSource,
-          "application/pdf"
-        );
+        // This branch is for the /hackrx/run endpoint when 'documents' is raw text
+        // (i.e., not a URL, and not an uploaded file with a specific fileType hint).
+        // It directly uses documentSource as the text content.
+        text = documentSource;
       }
 
-      logger.info("Splitting text into chunks", { 
-        textLength: text.length, 
-        storeId, 
-        requestId 
-      });
+      // **Crucial Check for the error:**
+      // Ensure 'text' is actually a string before proceeding.
+      // If it's not a string at this point, something fundamentally wrong happened
+      // with the input `documentSource` in the calling function.
+      if (typeof text !== "string") {
+        const errorMessage = `Invalid document content type. Expected string, got ${typeof text}. Value: ${text}`;
+        logger.error(errorMessage, {
+          documentSource,
+          requestId,
+          originalFileTypeHint: fileType,
+        });
+        throw new Error(errorMessage);
+      }
 
-      // Split text into chunks
-      const docs = await this.textSplitter.createDocuments([text]);
-
-      // Save chunks to file for debugging
-      const chunks = docs
-        .map((doc, index) => `--- Chunk ${index} ---\n${doc.pageContent}\n\n`)
-        .join("");
-
-      const chunksFilePath = path.join(logsDir, `chunks_${requestId}.txt`);
-      fs.writeFileSync(chunksFilePath, chunks, "utf8");
-      logger.info("Chunks written to file", { 
-        chunksFilePath, 
-        chunksCount: docs.length,
-        requestId 
-      });
-
-      // Check if embeddings are cached for similar content
+      // ...existing code for content hashing, FAISS store logic, etc...
+      // Calculate content hash for persistent caching
       const contentHash = require("crypto")
         .createHash("md5")
         .update(text)
         .digest("hex");
-      const embeddingCacheKey = `embeddings:${contentHash}`;
+      const faissStorePath = path.join(faissStoresDir, `${contentHash}.faiss`);
 
-      let vectorStore;
-      try {
-        const cachedEmbeddings = await redisClient.get(embeddingCacheKey);
-        if (cachedEmbeddings) {
-          logger.info("Found cached embeddings", { contentHash, requestId });
-          // Note: In a real implementation, you'd need to serialize/deserialize FAISS store
-          // For now, we'll create new embeddings but this shows the caching pattern
-        }
-      } catch (redisError) {
-        logger.warn("Embedding cache check failed", { error: redisError.message });
+      // Check if FAISS store is already on disk
+      if (fs.existsSync(faissStorePath)) {
+        logger.info("Loading FAISS store from disk cache", {
+          contentHash,
+          faissStorePath,
+          requestId,
+        });
+        const vectorStore = await FaissStore.load(faissStorePath, embeddings);
+        // Add to in-memory map for quick access during current session
+        vectorStores.set(contentHash, vectorStore);
+        return {
+          success: true,
+          chunksCount: "loaded_from_cache", // Indicate it was loaded
+          storeId: contentHash,
+        };
       }
 
-      logger.info("Creating embeddings", { 
-        chunksCount: docs.length, 
-        storeId, 
-        requestId 
+      logger.info("Splitting text into chunks", {
+        textLength: text.length,
+        requestId,
       });
 
-      // Create FAISS vector store with parallel processing
-      vectorStore = await FaissStore.fromDocuments(docs, embeddings);
+      const docs = await this.textSplitter.createDocuments([text]);
 
-      // Store the vector store
-      vectorStores.set(storeId, vectorStore);
+      // Save chunks to file for debugging (optional, can be removed in production)
+      const chunks = docs
+        .map((doc, index) => `--- Chunk ${index} ---\n${doc.pageContent}\n\n`)
+        .join("");
+      const chunksFilePath = path.join(logsDir, `chunks_${requestId}.txt`);
+      fs.writeFileSync(chunksFilePath, chunks, "utf8");
+      logger.info("Chunks written to file", {
+        chunksFilePath,
+        chunksCount: docs.length,
+        requestId,
+      });
 
-      // Cache embedding metadata
-      try {
-        await redisClient.setEx(
-          embeddingCacheKey,
-          EMBEDDING_CACHE_TTL,
-          JSON.stringify({ 
-            storeId, 
-            chunksCount: docs.length, 
-            createdAt: new Date().toISOString() 
-          })
-        );
-      } catch (redisError) {
-        logger.warn("Failed to cache embedding metadata", { error: redisError.message });
-      }
+      logger.info("Creating embeddings and FAISS store", {
+        chunksCount: docs.length,
+        requestId,
+      });
 
-      logger.info("Document processed successfully", { 
-        storeId, 
-        chunksCount: docs.length, 
-        requestId 
+      const vectorStore = await FaissStore.fromDocuments(docs, embeddings);
+
+      // Save the FAISS store to disk for persistence
+      await vectorStore.save(faissStorePath);
+      logger.info("FAISS store saved to disk", {
+        faissStorePath,
+        contentHash,
+        requestId,
+      });
+
+      // Add to in-memory map for quick access during current session
+      vectorStores.set(contentHash, vectorStore);
+
+      logger.info("Document processed successfully", {
+        storeId: contentHash,
+        chunksCount: docs.length,
+        requestId,
       });
 
       return {
         success: true,
         chunksCount: docs.length,
-        storeId: storeId,
+        storeId: contentHash,
       };
     } catch (error) {
-      logger.error("Error processing document", { 
-        storeId, 
-        requestId, 
+      logger.error("Error processing document", {
+        documentSource: documentSource.substring(0, 100),
+        requestId,
         error: error.message,
-        stack: error.stack 
+        stack: error.stack,
       });
       throw new Error(`Error processing document: ${error.message}`);
     }
@@ -381,17 +432,33 @@ class DocumentProcessor {
 
   async answerQuestions(questions, storeId, requestId) {
     try {
-      const vectorStore = vectorStores.get(storeId);
+      let vectorStore = vectorStores.get(storeId);
       if (!vectorStore) {
-        throw new Error(
-          "Document not found. Please upload the document first."
-        );
+        // If the store is not in memory, try to load it from disk based on contentHash (storeId)
+        const faissStorePath = path.join(faissStoresDir, `${storeId}.faiss`);
+        if (fs.existsSync(faissStorePath)) {
+          logger.info("Loading FAISS store for answering from disk", {
+            storeId,
+            faissStorePath,
+            requestId,
+          });
+          vectorStore = await FaissStore.load(faissStorePath, embeddings);
+          vectorStores.set(storeId, vectorStore); // Add to in-memory map
+          logger.info("FAISS store loaded for answering", {
+            storeId,
+            requestId,
+          });
+        } else {
+          throw new Error(
+            "Document not found. Please upload the document first or   it was cleared."
+          );
+        }
       }
 
-      logger.info("Processing questions", { 
-        questionsCount: questions.length, 
-        storeId, 
-        requestId 
+      logger.info("Processing questions", {
+        questionsCount: questions.length,
+        storeId,
+        requestId,
       });
 
       const answers = [];
@@ -399,22 +466,28 @@ class DocumentProcessor {
       // Process questions in parallel for speed
       const answerPromises = questions.map(async (question, index) => {
         const questionId = `q${index + 1}`;
-        logger.info("Processing question", { 
-          questionId, 
-          question: question.substring(0, 100), 
-          requestId 
+        logger.info("Processing question", {
+          questionId,
+          question: question.substring(0, 100),
+          requestId,
         });
 
         // Check cache for this specific question + document combination
-        const questionCacheKey = `answer:${storeId}:${Buffer.from(question).toString("base64")}`;
+        const questionCacheKey = `answer:${storeId}:${Buffer.from(
+          question
+        ).toString("base64")}`;
+        let cachedAnswer;
         try {
-          const cachedAnswer = await redisClient.get(questionCacheKey);
+          cachedAnswer = await redisClient.get(questionCacheKey);
           if (cachedAnswer) {
             logger.info("Found cached answer", { questionId, requestId });
             return { index, answer: JSON.parse(cachedAnswer) };
           }
         } catch (redisError) {
-          logger.warn("Answer cache check failed", { error: redisError.message });
+          logger.warn("Answer cache check failed", {
+            error: redisError.message,
+            requestId,
+          });
         }
 
         // Retrieve only top 10 most relevant docs
@@ -437,7 +510,7 @@ Instructions:
 - Give a one-sentence answer that includes all critical details from the context.
 - Limit to 35 words max.
 - Do NOT add any explanation or repeat the question.
-- If the answer is not in the context, try harder and infer from the document. You cannot say document not found unless you are 200% sure its not there and you cant infer from rest of document 
+- If the answer is not in the context, try harder and infer from the document. You cannot say document not found unless you are 200% sure its not there and you cant infer from rest of document
 - Respond only with a JSON array: ["answer"]
 
 Answer:
@@ -453,7 +526,7 @@ Answer:
         try {
           parsedAnswer = JSON.parse(rawText);
         } catch (e) {
-          parsedAnswer = [rawText];
+          parsedAnswer = [rawText]; // Fallback if not valid JSON
         }
 
         // Cache the answer
@@ -465,13 +538,16 @@ Answer:
           );
           logger.info("Cached answer", { questionId, requestId });
         } catch (redisError) {
-          logger.warn("Failed to cache answer", { error: redisError.message });
+          logger.warn("Failed to cache answer", {
+            error: redisError.message,
+            requestId,
+          });
         }
 
-        logger.info("Question processed", { 
-          questionId, 
-          answerLength: parsedAnswer[0]?.length || 0, 
-          requestId 
+        logger.info("Question processed", {
+          questionId,
+          answerLength: parsedAnswer[0]?.length || 0,
+          requestId,
         });
 
         return { index, answer: parsedAnswer };
@@ -483,19 +559,19 @@ Answer:
       // Sort by original order
       results.sort((a, b) => a.index - b.index);
 
-      logger.info("All questions processed", { 
-        questionsCount: questions.length, 
-        storeId, 
-        requestId 
+      logger.info("All questions processed", {
+        questionsCount: questions.length,
+        storeId,
+        requestId,
       });
 
       return results.flatMap((r) => r.answer);
     } catch (error) {
-      logger.error("Error answering questions", { 
-        storeId, 
-        requestId, 
+      logger.error("Error answering questions", {
+        storeId,
+        requestId,
         error: error.message,
-        stack: error.stack 
+        stack: error.stack,
       });
       throw new Error(`Error answering questions: ${error.message}`);
     }
@@ -532,42 +608,38 @@ app.post("/upload", upload.single("document"), async (req, res) => {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const storeId = `doc_${Date.now()}_${Math.random()
-      .toString(36)
-      .substr(2, 9)}`;
-
-    logger.info("File upload started", { 
+    logger.info("File upload started", {
       filename: req.file.originalname,
       size: req.file.size,
-      storeId,
-      requestId: req.requestId 
+      mimeType: req.file.mimetype,
+      requestId: req.requestId,
     });
 
     const result = await documentProcessor.processAndStoreDocument(
       req.file.path,
-      storeId,
-      req.requestId
+      req.requestId,
+      req.file.mimetype // Pass file type explicitly for file uploads
     );
 
     // Clean up uploaded file
     fs.unlinkSync(req.file.path);
 
-    logger.info("File upload completed", { 
-      storeId, 
+    logger.info("File upload completed", {
+      storeId: result.storeId,
       chunksCount: result.chunksCount,
-      requestId: req.requestId 
+      requestId: req.requestId,
     });
 
     res.json({
       message: "Document processed successfully",
-      storeId: storeId,
+      storeId: result.storeId, // Now the content hash
       chunksCount: result.chunksCount,
     });
   } catch (error) {
-    logger.error("Upload error", { 
-      error: error.message, 
+    logger.error("Upload error", {
+      error: error.message,
       requestId: req.requestId,
-      stack: error.stack 
+      stack: error.stack,
     });
     res.status(500).json({ error: error.message });
   }
@@ -578,11 +650,29 @@ app.post("/hackrx/run", async (req, res) => {
   const startTime = Date.now();
   const requestId = req.requestId;
 
+  // Create a dedicated HackRX logger for this request
+  const hackrxLogger = winston.createLogger({
+    transports: [
+      new winston.transports.File({
+        filename: path.join(logsDir, `hackrx-${requestId}.log`),
+        format: winston.format.combine(
+          winston.format.timestamp(),
+          winston.format.printf(({ timestamp, level, message, ...meta }) => {
+            return `${timestamp} [${level.toUpperCase()}]: ${message}\n${
+              Object.keys(meta).length ? JSON.stringify(meta, null, 2) : ""
+            }`;
+          })
+        ),
+      }),
+    ],
+  });
+
   try {
     // Validate authorization header
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       logger.warn("Invalid authorization header", { requestId });
+      hackrxLogger.warn("Invalid authorization header", { requestId });
       return res
         .status(401)
         .json({ error: "Missing or invalid authorization header" });
@@ -591,11 +681,17 @@ app.post("/hackrx/run", async (req, res) => {
     const { documents, questions } = req.body;
 
     if (!documents || !questions || !Array.isArray(questions)) {
-      logger.warn("Invalid request format", { 
+      logger.warn("Invalid request format", {
         hasDocuments: !!documents,
         hasQuestions: !!questions,
         questionsIsArray: Array.isArray(questions),
-        requestId 
+        requestId,
+      });
+      hackrxLogger.warn("Invalid request format", {
+        hasDocuments: !!documents,
+        hasQuestions: !!questions,
+        questionsIsArray: Array.isArray(questions),
+        requestId,
       });
       return res.status(400).json({
         error:
@@ -603,78 +699,73 @@ app.post("/hackrx/run", async (req, res) => {
       });
     }
 
-    // Generate a unique store ID for this request
-    const storeId = `hackrx_${Date.now()}_${Math.random()
-      .toString(36)
-      .substr(2, 9)}`;
+    // `documents` will now be either a URL or the raw text content itself.
+    // documentProcessor.processAndStoreDocument handles this.
 
-    logger.info("HackRX Request started", { 
+    logger.info("HackRX Request started", {
       questionsCount: questions.length,
-      documentLength: documents.length,
-      storeId,
+      documentInputLength: documents.length,
       requestId,
-      authHeader: authHeader.substring(0, 20) + "..."
+      authHeader: authHeader.substring(0, 20) + "...",
     });
 
-    // Log the full request details to HackRX log
-    const hackrxLogger = winston.createLogger({
-      transports: [
-        new winston.transports.File({
-          filename: path.join(logsDir, `hackrx-${requestId}.log`),
-          format: winston.format.combine(
-            winston.format.timestamp(),
-            winston.format.printf(({ timestamp, level, message, ...meta }) => {
-              return `${timestamp} [${level.toUpperCase()}]: ${message}\n${
-                Object.keys(meta).length ? JSON.stringify(meta, null, 2) : ""
-              }`;
-            })
-          ),
-        }),
-      ],
-    });
-
+    // Log the full request details to HackRX log file
     hackrxLogger.info("HackRX Request Details", {
       requestId,
-      storeId,
       timestamp: new Date().toISOString(),
       headers: req.headers,
       body: {
-        documents: documents.substring(0, 500) + "...",
+        documents: documents.substring(0, 500) + "...", // Truncate for log
         questions: questions,
       },
     });
 
-    // Process the document
-    logger.info("Processing document", { 
-      documentPreview: documents.substring(0, 100) + "...",
-      storeId,
-      requestId 
+    // Process the document - this will return the contentHash as storeId
+    logger.info("Processing document source", {
+      documentSourcePreview: documents.substring(0, 100) + "...",
+      requestId,
     });
-    
-    await documentProcessor.processAndStoreDocument(documents, storeId, requestId);
+
+    const docProcessingResult = await documentProcessor.processAndStoreDocument(
+      documents,
+      requestId
+    );
+    const storeId = docProcessingResult.storeId; // This is now the content hash
+
+    logger.info("Document processed (or loaded from cache)", {
+      storeId,
+      chunksCount: docProcessingResult.chunksCount,
+      requestId,
+    });
+    hackrxLogger.info("Document processed (or loaded from cache)", {
+      storeId,
+      chunksCount: docProcessingResult.chunksCount,
+      requestId,
+    });
 
     // Answer the questions
-    logger.info("Answering questions", { 
+    logger.info("Answering questions", {
       questionsCount: questions.length,
       storeId,
-      requestId 
+      requestId,
     });
-    
-    const answers = await documentProcessor.answerQuestions(questions, storeId, requestId);
 
-    // Clean up the vector store immediately for memory efficiency
-    vectorStores.delete(storeId);
+    const answers = await documentProcessor.answerQuestions(
+      questions,
+      storeId, // Pass the content hash as storeId
+      requestId
+    );
 
     const processingTime = Date.now() - startTime;
-    
-    logger.info("HackRX Request completed", { 
+
+    logger.info("HackRX Request completed", {
       processingTime: `${processingTime}ms`,
       answersCount: answers.length,
       storeId,
-      requestId 
+      requestId,
     });
 
-    // Log the response to HackRX log
+    // Log the response to HackRX log file
     hackrxLogger.info("HackRX Response", {
       requestId,
       storeId,
@@ -689,25 +780,34 @@ app.post("/hackrx/run", async (req, res) => {
     });
   } catch (error) {
     const processingTime = Date.now() - startTime;
-    
-    logger.error("HackRX error", { 
+
+    logger.error("HackRX error", {
       processingTime: `${processingTime}ms`,
       error: error.message,
       stack: error.stack,
-      requestId 
+      requestId,
     });
-    
+    hackrxLogger.error("HackRX error", {
+      processingTime: `${processingTime}ms`,
+      error: error.message,
+      stack: error.stack,
+      requestId,
+    });
+
     res.status(500).json({
       error: "Internal server error",
       message: error.message,
     });
+  } finally {
+    // Ensure the hackrxLogger is closed/flushed
+    hackrxLogger.end();
   }
 });
 
 // Answer questions for existing document
 app.post("/answer/:storeId", async (req, res) => {
   try {
-    const { storeId } = req.params;
+    const { storeId } = req.params; // storeId is now expected to be the content hash
     const { questions } = req.body;
 
     if (!questions || !Array.isArray(questions)) {
@@ -716,15 +816,15 @@ app.post("/answer/:storeId", async (req, res) => {
         .json({ error: "Questions must be provided as an array" });
     }
 
-    logger.info("Answering questions for existing document", { 
-      storeId, 
+    logger.info("Answering questions for existing document", {
+      storeId,
       questionsCount: questions.length,
-      requestId: req.requestId 
+      requestId: req.requestId,
     });
 
     const answers = await documentProcessor.answerQuestions(
-      questions, 
-      storeId, 
+      questions,
+      storeId,
       req.requestId
     );
 
@@ -733,55 +833,92 @@ app.post("/answer/:storeId", async (req, res) => {
       answers: answers,
     });
   } catch (error) {
-    logger.error("Answer error", { 
+    logger.error("Answer error", {
       storeId: req.params.storeId,
       error: error.message,
-      requestId: req.requestId 
+      requestId: req.requestId,
     });
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get available document stores
+// Get available document stores (lists FAISS files by their content hash names)
 app.get("/stores", (req, res) => {
-  const stores = Array.from(vectorStores.keys());
-  logger.info("Document stores requested", { 
-    storesCount: stores.length,
-    requestId: req.requestId 
-  });
-  res.json({ stores: stores, count: stores.length });
+  try {
+    const stores = fs
+      .readdirSync(faissStoresDir)
+      .filter((file) => file.endsWith(".faiss"))
+      .map((file) => file.replace(".faiss", "")); // Just the hash
+    logger.info("Document stores requested", {
+      storesCount: stores.length,
+      requestId: req.requestId,
+    });
+    res.json({ stores: stores, count: stores.length });
+  } catch (error) {
+    logger.error("Error listing stores", {
+      error: error.message,
+      requestId: req.requestId,
+    });
+    res.status(500).json({ error: "Failed to list stores" });
+  }
 });
 
-// Delete a document store
+// Delete a document store (FAISS file and in-memory if present)
 app.delete("/stores/:storeId", (req, res) => {
-  const { storeId } = req.params;
+  const { storeId } = req.params; // storeId is the content hash
 
-  if (vectorStores.has(storeId)) {
-    vectorStores.delete(storeId);
-    logger.info("Document store deleted", { 
-      storeId,
-      requestId: req.requestId 
-    });
-    res.json({ message: "Document store deleted successfully" });
+  const faissStorePath = path.join(faissStoresDir, `${storeId}.faiss`);
+
+  if (fs.existsSync(faissStorePath)) {
+    try {
+      fs.unlinkSync(faissStorePath);
+      vectorStores.delete(storeId); // Also remove from in-memory cache
+      logger.info("Document store deleted", {
+        storeId,
+        faissStorePath,
+        requestId: req.requestId,
+      });
+      res.json({ message: "Document store deleted successfully" });
+    } catch (error) {
+      logger.error("Error deleting document store file", {
+        storeId,
+        faissStorePath,
+        error: error.message,
+        requestId: req.requestId,
+      });
+      res.status(500).json({ error: "Failed to delete document store" });
+    }
   } else {
-    logger.warn("Document store not found for deletion", { 
+    logger.warn("Document store not found for deletion", {
       storeId,
-      requestId: req.requestId 
+      requestId: req.requestId,
     });
     res.status(404).json({ error: "Document store not found" });
   }
 });
 
-// Clear cache endpoint
+// Clear cache endpoint - now also removes FAISS files
 app.post("/cache/clear", async (req, res) => {
   try {
-    await redisClient.flushAll();
-    logger.info("Cache cleared", { requestId: req.requestId });
-    res.json({ message: "Cache cleared successfully" });
+    await redisClient.flushAll(); // Clear Redis cache
+    logger.info("Redis cache cleared", { requestId: req.requestId });
+
+    // Clear FAISS store files
+    fs.readdirSync(faissStoresDir).forEach((file) => {
+      if (file.endsWith(".faiss")) {
+        fs.unlinkSync(path.join(faissStoresDir, file));
+      }
+    });
+    vectorStores.clear(); // Clear in-memory map
+    logger.info("FAISS stores cleared from disk and memory", {
+      requestId: req.requestId,
+    });
+
+    res.json({ message: "All caches cleared successfully" });
   } catch (error) {
-    logger.error("Error clearing cache", { 
+    logger.error("Error clearing cache", {
       error: error.message,
-      requestId: req.requestId 
+      requestId: req.requestId,
     });
     res.status(500).json({ error: "Failed to clear cache" });
   }
@@ -792,34 +929,39 @@ app.get("/cache/stats", async (req, res) => {
   try {
     const info = await redisClient.info();
     const keyCount = await redisClient.dbSize();
-    
+    const faissFiles = fs
+      .readdirSync(faissStoresDir)
+      .filter((file) => file.endsWith(".faiss")).length;
+
     res.json({
       connected: true,
-      keyCount,
-      info: info.split('\r\n').reduce((acc, line) => {
-        const [key, value] = line.split(':');
+      redisKeyCount: keyCount,
+      faissStoresOnDisk: faissFiles,
+      inMemoryFaissStores: vectorStores.size,
+      info: info.split("\r\n").reduce((acc, line) => {
+        const [key, value] = line.split(":");
         if (key && value) acc[key] = value;
         return acc;
       }, {}),
     });
   } catch (error) {
-    logger.error("Error getting cache stats", { 
+    logger.error("Error getting cache stats", {
       error: error.message,
-      requestId: req.requestId 
+      requestId: req.requestId,
     });
-    res.status(500).json({ 
-      connected: false, 
-      error: error.message 
+    res.status(500).json({
+      connected: false,
+      error: error.message,
     });
   }
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  logger.error("Unhandled error", { 
+  logger.error("Unhandled error", {
     error: error.message,
     stack: error.stack,
-    requestId: req.requestId 
+    requestId: req.requestId,
   });
   res.status(500).json({
     error: "Internal server error",
@@ -829,10 +971,10 @@ app.use((error, req, res, next) => {
 
 // 404 handler
 app.use((req, res) => {
-  logger.warn("Endpoint not found", { 
+  logger.warn("Endpoint not found", {
     method: req.method,
     url: req.url,
-    requestId: req.requestId 
+    requestId: req.requestId,
   });
   res.status(404).json({ error: "Endpoint not found" });
 });
@@ -844,32 +986,39 @@ app.listen(port, () => {
   console.log("Available endpoints:");
   console.log("  POST /hackrx/run - Main endpoint (matches sample format)");
   console.log("  POST /upload - Upload document file");
-  console.log("  POST /answer/:storeId - Answer questions for existing document");
+  console.log(
+    "  POST /answer/:storeId - Answer questions for existing document"
+  );
   console.log("  GET /stores - List document stores");
   console.log("  DELETE /stores/:storeId - Delete document store");
-  console.log("  POST /cache/clear - Clear Redis cache");
+  console.log("  POST /cache/clear - Clear Redis cache and FAISS files");
   console.log("  GET /cache/stats - Get cache statistics");
   console.log("  GET /health - Health check");
   console.log(`Logs are being saved to: ${logsDir}`);
+  console.log(`FAISS stores are being saved to: ${faissStoresDir}`);
 });
 
 // Graceful shutdown
 process.on("SIGINT", async () => {
   logger.info("Shutting down gracefully...");
   console.log("\nShutting down gracefully...");
-  
+
   try {
     await redisClient.quit();
     logger.info("Redis connection closed");
   } catch (error) {
     logger.error("Error closing Redis connection", { error: error.message });
   }
-  
+
   process.exit(0);
 });
 
 process.on("uncaughtException", (error) => {
-  logger.error("Uncaught Exception", { error: error.message, stack: error.stack });
+  logger.error("Uncaught Exception", {
+    error: error.message,
+    stack: error.stack,
+  });
+  // Consider more robust error handling / process restart strategies in production
   process.exit(1);
 });
 
