@@ -2,12 +2,13 @@ import os
 import uuid
 import json
 import traceback
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app,Flask
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from unstructured.partition.pdf import partition_pdf
 import google.generativeai as genai
 import warnings
+import faiss
 
 load_dotenv()
 
@@ -123,3 +124,10 @@ def query():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app = Flask(__name__)
+    model = setup_gemini()
+    app.config["gemini_model"] = model
+    app.register_blueprint(gemini_bp)
+    app.run(debug=True)
