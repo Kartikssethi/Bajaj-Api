@@ -6,7 +6,7 @@ const mammoth = require("mammoth");
 const { FaissStore } = require("@langchain/community/vectorstores/faiss");
 const { GoogleGenerativeAIEmbeddings } = require("@langchain/google-genai");
 const { RecursiveCharacterTextSplitter } = require("@langchain/textsplitters");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { Groq } = require("groq-sdk");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -54,9 +54,6 @@ const logger = winston.createLogger({
       maxSize: "20m",
       maxFiles: "14d",
     }),
-    // HackRX specific logs (now with dynamic filename for request details)
-    // The "hackrx" transport will be created dynamically per request in the /hackrx/run route
-    // to allow logging request/response bodies separately.
   ],
 });
 
@@ -151,11 +148,12 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
 });
 
-// Initialize Gemini with latest 2.5 Flash model
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+// Initialize Groq client
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
-// Initialize embeddings with latest model
+// Initialize embeddings with Google (keeping for embeddings as Groq doesn't provide embeddings)
 const embeddings = new GoogleGenerativeAIEmbeddings({
   apiKey: process.env.GOOGLE_API_KEY,
   model: "text-embedding-004", // Latest embedding model
@@ -167,7 +165,6 @@ const vectorStores = new Map();
 
 // Cache configuration
 const CACHE_TTL = 3600; // 1 hour in seconds for answers and URL content
-// EMBEDDING_CACHE_TTL is less relevant now as FAISS stores are directly persisted
 
 class DocumentProcessor {
   constructor() {
@@ -300,10 +297,6 @@ class DocumentProcessor {
     }
   }
 
-  // documentSource can be:
-  // 1. A local file path (from /upload endpoint)
-  // 2. A URL (from /hackrx/run endpoint or directly in /upload if you support URL upload there)
-  // 3. Raw text content (from /hackrx/run endpoint)
   async processAndStoreDocument(documentSource, requestId, fileType = null) {
     try {
       let text;
@@ -318,24 +311,15 @@ class DocumentProcessor {
       if (documentSource.startsWith("http")) {
         // If it's a URL, download and extract
         text = await this.downloadAndExtractFromUrl(documentSource, requestId);
-        // For URL, we already extracted to text, so fileType becomes irrelevant
-        // or can be considered 'text/plain' conceptually.
       } else if (actualFileType) {
-        // This branch is explicitly for file uploads (e.g., from /upload)
-        // where documentSource is a file path on the server's temp directory
-        // and fileType is the actual MIME type of the uploaded file.
+        // This branch is explicitly for file uploads
         text = await this.extractTextFromFile(documentSource, actualFileType);
       } else {
-        // This branch is for the /hackrx/run endpoint when 'documents' is raw text
-        // (i.e., not a URL, and not an uploaded file with a specific fileType hint).
-        // It directly uses documentSource as the text content.
+        // This branch is for raw text content
         text = documentSource;
       }
 
-      // **Crucial Check for the error:**
-      // Ensure 'text' is actually a string before proceeding.
-      // If it's not a string at this point, something fundamentally wrong happened
-      // with the input `documentSource` in the calling function.
+      // Ensure 'text' is actually a string before proceeding
       if (typeof text !== "string") {
         const errorMessage = `Invalid document content type. Expected string, got ${typeof text}. Value: ${text}`;
         logger.error(errorMessage, {
@@ -346,7 +330,6 @@ class DocumentProcessor {
         throw new Error(errorMessage);
       }
 
-      // ...existing code for content hashing, FAISS store logic, etc...
       // Calculate content hash for persistent caching
       const contentHash = require("crypto")
         .createHash("md5")
@@ -450,7 +433,7 @@ class DocumentProcessor {
           });
         } else {
           throw new Error(
-            "Document not found. Please upload the document first or   it was cleared."
+            "Document not found. Please upload the document first or it was cleared."
           );
         }
       }
@@ -497,8 +480,7 @@ class DocumentProcessor {
         const context = relevantDocs.map((doc) => doc.pageContent).join("\n\n");
 
         // Optimized prompt for faster response
-        const prompt = `
-You are an expert assistant. Use ONLY the following context to answer the question.
+        const prompt = `You are an expert assistant. Use ONLY the following context to answer the question.
 
 Context:
 ${context}
@@ -511,46 +493,74 @@ Instructions:
 - Limit to 35 words max.
 - Do NOT add any explanation or repeat the question.
 - If the answer is not in the context, try harder and infer from the document. You cannot say document not found unless you are 200% sure its not there and you cant infer from rest of document
-- Respond only with a JSON array: ["answer"]
+- Respond only with a JSON object in this format: {"answer": "your answer here"}
 
-Answer:
-`;
+Answer:`;
 
-        const result = await model.generateContent(prompt);
-        let rawText = result.response.text().trim();
-
-        // Clean up code block formatting (remove ```json and ```)
-        rawText = rawText.replace(/```json|```/g, "").trim();
-
-        let parsedAnswer;
         try {
-          parsedAnswer = JSON.parse(rawText);
-        } catch (e) {
-          parsedAnswer = [rawText]; // Fallback if not valid JSON
-        }
+          const chatCompletion = await groq.chat.completions.create({
+            messages: [
+              {
+                role: "user",
+                content: prompt,
+              },
+            ],
+            model: "gemma2-9b-it",
+            temperature: 0.1, // Lower temperature for more consistent answers
+            max_completion_tokens: 1024,
+            top_p: 1,
+            stream: false,
+            response_format: {
+              type: "json_object",
+            },
+            stop: null,
+          });
 
-        // Cache the answer
-        try {
-          await redisClient.setEx(
-            questionCacheKey,
-            CACHE_TTL,
-            JSON.stringify(parsedAnswer)
-          );
-          logger.info("Cached answer", { questionId, requestId });
-        } catch (redisError) {
-          logger.warn("Failed to cache answer", {
-            error: redisError.message,
+          const responseContent = chatCompletion.choices[0].message.content;
+          let parsedAnswer;
+
+          try {
+            const jsonResponse = JSON.parse(responseContent);
+            parsedAnswer = [jsonResponse.answer || responseContent];
+          } catch (parseError) {
+            // Fallback if JSON parsing fails
+            parsedAnswer = [responseContent];
+          }
+
+          // Cache the answer
+          try {
+            await redisClient.setEx(
+              questionCacheKey,
+              CACHE_TTL,
+              JSON.stringify(parsedAnswer)
+            );
+            logger.info("Cached answer", { questionId, requestId });
+          } catch (redisError) {
+            logger.warn("Failed to cache answer", {
+              error: redisError.message,
+              requestId,
+            });
+          }
+
+          logger.info("Question processed", {
+            questionId,
+            answerLength: parsedAnswer[0]?.length || 0,
             requestId,
           });
+
+          return { index, answer: parsedAnswer };
+        } catch (groqError) {
+          logger.error("Groq API error", {
+            questionId,
+            error: groqError.message,
+            requestId,
+          });
+          // Fallback answer
+          return {
+            index,
+            answer: ["Unable to process question due to API error."],
+          };
         }
-
-        logger.info("Question processed", {
-          questionId,
-          answerLength: parsedAnswer[0]?.length || 0,
-          requestId,
-        });
-
-        return { index, answer: parsedAnswer };
       });
 
       // Wait for all answers to complete
@@ -698,9 +708,6 @@ app.post("/hackrx/run", async (req, res) => {
           "Invalid request format. Expected documents (string) and questions (array)",
       });
     }
-
-    // `documents` will now be either a URL or the raw text content itself.
-    // documentProcessor.processAndStoreDocument handles this.
 
     logger.info("HackRX Request started", {
       questionsCount: questions.length,
