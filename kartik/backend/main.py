@@ -1,161 +1,197 @@
 import os
-import uuid
-import json
-import traceback
-import warnings
+import tempfile
+import requests
+import pickle
+import numpy as np
+import faiss
+import redis
+from PyPDF2 import PdfReader
 from dotenv import load_dotenv
-from flask import Blueprint, request, jsonify, current_app
-from werkzeug.utils import secure_filename
-from unstructured.partition.pdf import partition_pdf
-from supabase import create_client
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Request
 import google.generativeai as genai
-import pytesseract  # OCR tool
-import PIL
 
-# Load environment variables
+# Fix OpenMP issue on macOS
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 load_dotenv()
-ocr_agent = pytesseract.image_to_string 
-gemini_bp = Blueprint("gemini", __name__)
 
-def setup_gemini():
-    """Sets up Google Gemini API. Returns a generative model."""
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    PINECONE_API_KEY=os.getenv("PINECONE_API_KEY")
-    
-    # Ensure the GEMINI_API_KEY is set properly
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable must be set.")
-    
-    genai.configure(api_key=GEMINI_API_KEY)
-    return genai.GenerativeModel(model_name="gemini-2.5-pro")
+# Load Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set in .env")
+genai.configure(api_key=GEMINI_API_KEY)
 
+# Redis setup
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+# FAISS setup
+EMBEDDING_DIM = 768
+KARTIK_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'kartik'))
+os.makedirs(KARTIK_DIR, exist_ok=True)
+
+FAISS_INDEX_PATH = os.path.join(KARTIK_DIR, "faiss_index.index")
+MAPPING_PATH = os.path.join(KARTIK_DIR, "faiss_id_to_text.pkl")
+
+if os.path.exists(FAISS_INDEX_PATH):
+    FAISS_INDEX = faiss.read_index(FAISS_INDEX_PATH)
+else:
+    FAISS_INDEX = faiss.IndexFlatL2(EMBEDDING_DIM)
+
+if os.path.exists(MAPPING_PATH):
+    with open(MAPPING_PATH, "rb") as f:
+        FAISS_ID_TO_TEXT = pickle.load(f)
+else:
+    FAISS_ID_TO_TEXT = {}
+
+# FastAPI app
+app = FastAPI()
+
+# Embedding helper
 def get_embedding(text):
-    """Generates an embedding for the given text using the Gemini API."""
-    response = genai.embed_content(model="models/embedding-001", content=text)
-    return response.get("embedding", [])
+    cache_key = f"embedding:{hash(text)}"
+    cached = redis_client.get(cache_key)
+    if cached:
+        return np.frombuffer(cached, dtype='float32')
+    response = genai.embed_content(model="text-embedding-004", content=text)
+    embedding = np.array(response.get("embedding", []), dtype='float32')
+    redis_client.set(cache_key, embedding.tobytes())
+    return embedding
 
-def store_content_and_embeddings(file_path):
+# Extract 10-page chunks
+def extract_chunks_by_10_pages(file_path):
+    reader = PdfReader(file_path)
+    total_pages = len(reader.pages)
+    chunks = []
+    for i in range(0, total_pages, 5):
+        chunk = ""
+        for j in range(i, min(i + 5, total_pages)):
+            page_text = reader.pages[j].extract_text()
+            if page_text:
+                chunk += page_text
+        if chunk.strip():
+            chunks.append(chunk.strip())
+    return chunks
+
+# Save FAISS + mapping
+def persist_faiss_data():
+    faiss.write_index(FAISS_INDEX, FAISS_INDEX_PATH)
+    with open(MAPPING_PATH, "wb") as f:
+        pickle.dump(FAISS_ID_TO_TEXT, f)
+
+# Upload PDF
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided")
+    file_path = f"./tmp_{file.filename}"
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
     try:
-        elements = partition_pdf(
-            filename=file_path,
-            strategy="hi_res",  # Best for layout-aware documents
-            chunking_strategy="by_title",  # Logical sectioning
-            infer_table_strategy=True,  # Extracts tables as structured data
-            max_characters=1000,  # Ideal chunk size for embeddings
-            new_after_n_chars=1200,  # Slightly tighter wrap to avoid overlap
-            combine_text_under_n_chars=300,  # Merges tiny fragments for context
-        )
-        return elements  # or store to DB if needed
-    except Exception as e:
-        print(f"Error in store_content_and_embeddings: {e}")
-        raise
-
-
-
-
-def make_prompt(query, context):
-    """Creates a prompt for Gemini using context."""
-    return f"Based on the following information, answer the question:\n\n{context}\n\nQuestion: {query}"
-
-def generate_ai_response(user_query, context_text):
-    """Generates an AI answer and saves it to the database."""
-    model = current_app.config["gemini_model"]
-    warnings.filterwarnings("ignore")
-
-    prompt = make_prompt(user_query, context_text)
-    response = model.generate_content(prompt)
-    answer_text = response.text.strip()
-
-    ai_user_id = user_id
-    message_id = str(uuid.uuid4())
-
-
-    return answer_text
-
-@gemini_bp.route("/upload", methods=["POST"])
-def upload_file():
-    """Handles file uploads, extracts content, and stores embeddings."""
-    supabase = current_app.config["supabase_client"]
-    file_path = None
-
-    try:
-        group_id = request.form.get("group_id")
-        sender_id = request.form.get("sender_id")
-        sender_role = request.form.get("sender_role")
-
-        if not all([group_id, sender_id, sender_role]):
-            return jsonify({"error": "Missing group_id, sender_id, or sender_role"}), 400
-
-        if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
-
-        file = request.files["file"]
-        if file.filename == "":
-            return jsonify({"error": "Empty filename"}), 400
-
-        filename = secure_filename(file.filename)
-        file_path = f"./tmp_{filename}"
-        file.save(file_path)
-
-        store_content_and_embeddings(file_path, supabase, group_id, sender_id, sender_role)
-
-        return jsonify({"message": "✅ Content and embeddings uploaded successfully!"}), 200
-
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
+        chunks = extract_chunks_by_10_pages(file_path)
+        for text in chunks:
+            embedding = get_embedding(text).reshape(1, -1)
+            idx = FAISS_INDEX.ntotal
+            FAISS_INDEX.add(embedding)
+            FAISS_ID_TO_TEXT[idx] = text
+        persist_faiss_data()
+        return {"message": "File processed and embeddings stored."}
     finally:
-        if file_path and os.path.exists(file_path):
+        if os.path.exists(file_path):
             os.remove(file_path)
 
-@gemini_bp.route("/query", methods=["POST"])
-def ask_question():
-    """Handles user queries and returns answers using Gemini or teacher context."""
-    supabase = current_app.config["supabase_client"]
+# Ask question
+@app.post("/ask")
+async def ask_question(request: Request):
+    data = await request.json()
+    question = data.get("question")
+    if not question:
+        raise HTTPException(status_code=400, detail="No question provided")
+    if FAISS_INDEX.ntotal == 0:
+        raise HTTPException(status_code=400, detail="FAISS index is empty")
+    q_emb = get_embedding(question).reshape(1, -1)
+    D, I = FAISS_INDEX.search(q_emb, k=min(3, FAISS_INDEX.ntotal))
+    context_chunks = [FAISS_ID_TO_TEXT.get(int(i), "") for i in I[0]]
+    context = "\n\n".join(context_chunks)
+    prompt = f"""
+You are an expert retrieval assistant for insurance policy documents. Your task is to read through provided policy excerpts and answer user questions based strictly on the content.
 
+Guidelines:
+- Only use the provided context for your answer.
+- Be specific, concise, and explain any relevant conditions or limitations.
+- If the information is not present in the context, clearly say so.
+- Include a short explanation if needed.
+- Output should be in the following JSON format:
+{{
+  "answer": "...",
+  "source_clause": "...",
+  "reasoning": "..."
+}}
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+    model = genai.GenerativeModel(model_name="gemini-2.5-pro")
+    response = model.generate_content(prompt)
+    return {"answer": response.text.strip()}
+
+# HackRx run endpoint
+@app.post("/hackrx/run")
+async def hackrx_run(request: Request, authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    data = await request.json()
+    pdf_url = data.get("documents")
+    questions = data.get("questions", [])
+    if not pdf_url or not questions:
+        raise HTTPException(status_code=400, detail="Missing documents URL or questions")
     try:
-        data = request.get_json()
-        user_query = data.get("query")
-        group_id = data.get("group_id")
-        user_id = data.get("user_id")
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            response = requests.get(pdf_url)
+            tmp_file.write(response.content)
+            tmp_file_path = tmp_file.name
+        chunks = extract_chunks_by_10_pages(tmp_file_path)
+        global FAISS_INDEX, FAISS_ID_TO_TEXT
+        FAISS_INDEX = faiss.IndexFlatL2(EMBEDDING_DIM)
+        FAISS_ID_TO_TEXT = {}
+        for text in chunks:
+            embedding = get_embedding(text).reshape(1, -1)
+            idx = FAISS_INDEX.ntotal
+            FAISS_INDEX.add(embedding)
+            FAISS_ID_TO_TEXT[idx] = text
+        persist_faiss_data()
+    finally:
+        if os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
+    answers = []
+    for question in questions:
+        q_emb = get_embedding(question).reshape(1, -1)
+        D, I = FAISS_INDEX.search(q_emb, k=min(3, FAISS_INDEX.ntotal))
+        context_chunks = [FAISS_ID_TO_TEXT.get(int(i), "") for i in I[0]]
+        context = "\n\n".join(context_chunks)
+        prompt = f"""
+You are an expert retrieval assistant for insurance policy documents. Your task is to read through provided policy excerpts and answer user questions based strictly on the content.
 
-        if not user_query:
-            return jsonify({"error": "Missing 'query'"}), 400
+Guidelines:
+- Only use the provided context for your answer.
+- Be specific, concise, and explain any relevant conditions or limitations.
+- If the information is not present in the context, clearly say so.
+- Include a short explanation if needed.
+- Output should be in the following JSON format:
+{{
+  "answer": "...",
+  "source_clause": "...",
+  "reasoning": "..."
+}}
 
-        # Return existing answer if already present
-        existing = supabase.table("answers").select("*").eq("query", user_query).execute()
-        if existing.data:
-            return jsonify({"msg": "Answer already exists", "answer": existing.data[0]["answers"]}), 200
+Context:
+{context}
 
-        # Check if teacher is available
-        group_info = supabase.table("groups").select("teacher_id").eq("id", group_id).execute().data
-        teacher_id = group_info[0]["teacher_id"] if group_info else None
-
-        is_teacher_available = True
-        if teacher_id:
-            teacher_info = supabase.table("teachers").select("is_available").eq("id", teacher_id).execute().data
-            is_teacher_available = teacher_info[0]["is_available"] if teacher_info else True
-
-        # Fetch context
-        context_data = fetch_relevant_content(supabase, group_id)
-        context_text = "\n".join(context_data)
-
-        # Generate and return AI answer
-        ai_response = generate_ai_response(user_query, context_text, supabase, group_id, user_id)
-        return jsonify({"answer": ai_response})
-    
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-# OCR function for extracting text from images
-def extract_text_from_image(file_path):
-    """Extracts text from an image using OCR."""
-    try:
-        img = Image.open(file_path)
-        text = pytesseract.image_to_string(img)  # Use the OCR agent here
-        return text
-    except Exception as e:
-        print(f"Error extracting text: {e}")
-        return None
+Question:
+{question}
+"""
+        model = genai.GenerativeModel(model_name="gemini-2.5-pro")
+        response = model.generate_content(prompt)
+        answers.append(response.text.strip())
+    return {"answers": answers}
