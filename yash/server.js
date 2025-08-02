@@ -21,6 +21,31 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 
+// Logging middleware for all incoming JSON requests
+app.use((req, res, next) => {
+  if (
+    req.method === "POST" &&
+    req.headers["content-type"]?.includes("application/json")
+  ) {
+    const timestamp = new Date().toISOString();
+    const requestId = `req_${Date.now()}_${Math.random()
+      .toString(36)
+      .substr(2, 9)}`;
+
+    console.log(
+      `📥 [${requestId}] ${timestamp} - Incoming ${req.method} ${req.path}`
+    );
+    console.log(
+      `📋 [${requestId}] Request Body:`,
+      JSON.stringify(req.body, null, 2)
+    );
+
+    // Store requestId for response logging
+    req.requestId = requestId;
+  }
+  next();
+});
+
 // Initialize clients with latest models
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
@@ -142,10 +167,21 @@ class UltraFastAccurateProcessor {
 
   async downloadPDF(url) {
     const urlHash = crypto.createHash("sha256").update(url).digest("hex");
+    const pdfFileName = `pdf_${urlHash}.pdf`;
+    const pdfFilePath = path.join(__dirname, "temp", pdfFileName);
+
+    // Ensure temp directory exists
+    if (!fs.existsSync(path.join(__dirname, "temp"))) {
+      fs.mkdirSync(path.join(__dirname, "temp"), { recursive: true });
+    }
 
     // Multi-level caching check
     if (textCache.has(urlHash)) {
-      return { text: textCache.get(urlHash), fromCache: true };
+      return {
+        text: textCache.get(urlHash),
+        fromCache: true,
+        filePath: pdfFilePath,
+      };
     }
 
     try {
@@ -155,7 +191,7 @@ class UltraFastAccurateProcessor {
           .gunzipSync(Buffer.from(cached, "base64"))
           .toString();
         textCache.set(urlHash, decompressed);
-        return { text: decompressed, fromCache: true };
+        return { text: decompressed, fromCache: true, filePath: pdfFilePath };
       }
     } catch (e) {
       console.warn("Redis cache miss:", e.message);
@@ -218,6 +254,16 @@ class UltraFastAccurateProcessor {
       ).toFixed(2)}MB`
     );
 
+    // Save PDF to temp folder
+    try {
+      fs.writeFileSync(pdfFilePath, buffer);
+      console.log(`💾 PDF saved to: ${pdfFilePath}`);
+    } catch (saveError) {
+      console.warn(
+        `⚠️ Failed to save PDF to temp folder: ${saveError.message}`
+      );
+    }
+
     // Enhanced PDF parsing with better error handling
     const parseStart = Date.now();
     const data = await pdfParse(buffer, {
@@ -242,7 +288,7 @@ class UltraFastAccurateProcessor {
       console.warn("Redis cache write failed:", e.message);
     }
 
-    return { text: data.text, fromCache: false };
+    return { text: data.text, fromCache: false, filePath: pdfFilePath };
   }
 
   async createVectorStore(text, contentHash) {
@@ -565,14 +611,16 @@ app.post("/hackrx/run", async (req, res) => {
     );
 
     // Step 1: Download and parse PDF (optimized)
-    const { text, fromCache: textCached } = await processor.downloadPDF(
-      documents
-    );
+    const {
+      text,
+      fromCache: textCached,
+      filePath,
+    } = await processor.downloadPDF(documents);
     const downloadTime = Date.now() - startTime;
     console.log(
       `📄 Text ${
         textCached ? "loaded from cache" : "downloaded"
-      } in ${downloadTime}ms`
+      } in ${downloadTime}ms${filePath ? `, saved to: ${filePath}` : ""}`
     );
 
     if (!text || text.length < 100) {
@@ -621,9 +669,17 @@ app.post("/hackrx/run", async (req, res) => {
     }
 
     // Enhanced response with metadata
-    res.json({
+    const responseData = {
       answers: answers,
-    });
+    };
+
+    // Log the response
+    console.log(
+      `📤 [${req.requestId || requestId}] Response:`,
+      JSON.stringify(responseData, null, 2)
+    );
+
+    res.json(responseData);
   } catch (error) {
     const errorTime = Date.now() - startTime;
     console.error(
@@ -632,13 +688,21 @@ app.post("/hackrx/run", async (req, res) => {
     );
 
     // Enhanced error response
-    res.status(500).json({
+    const errorResponse = {
       error: "Processing failed",
       message: error.message,
       processing_time_ms: errorTime,
       request_id: requestId,
       timestamp: new Date().toISOString(),
-    });
+    };
+
+    // Log the error response
+    console.log(
+      `📤 [${req.requestId || requestId}] Error Response:`,
+      JSON.stringify(errorResponse, null, 2)
+    );
+
+    res.status(500).json(errorResponse);
   }
 });
 
