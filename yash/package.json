@@ -20,6 +20,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.859.0",
     "@google/generative-ai": "^0.24.1",
     "@langchain/community": "^0.3.49",
     "@langchain/core": "^0.3.66",
@@ -31,10 +32,13 @@
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "faiss-node": "^0.5.1",
+    "groq-sdk": "^0.29.0",
     "langchain": "^0.3.30",
     "mammoth": "^1.9.1",
     "multer": "^2.0.2",
+    "openai": "^5.11.0",
     "pdf-parse": "^1.1.1",
+    "redis": "^5.7.0",
     "winston": "^3.17.0",
     "winston-daily-rotate-file": "^5.0.0"
   },
