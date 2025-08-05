@@ -4,28 +4,22 @@ const pdfParse = require("pdf-parse");
 const { FaissStore } = require("@langchain/community/vectorstores/faiss");
 const { GoogleGenerativeAIEmbeddings } = require("@langchain/google-genai");
 const { RecursiveCharacterTextSplitter } = require("@langchain/textsplitters");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { Groq } = require("groq-sdk");
-const {
-  BedrockRuntimeClient,
-  InvokeModelCommand,
-} = require("@aws-sdk/client-bedrock-runtime");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const redis = require("redis");
 const crypto = require("crypto");
-const cluster = require("cluster");
-const os = require("os");
 require("dotenv").config();
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Enhanced middleware with compression
 app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 
-// Logging middleware for all incoming JSON requests
+
 app.use((req, res, next) => {
   if (
     req.method === "POST" &&
@@ -43,35 +37,21 @@ app.use((req, res, next) => {
       `📋 [${requestId}] Request Body:`,
       JSON.stringify(req.body, null, 2)
     );
-
     // Store requestId for response logging
     req.requestId = requestId;
   }
   next();
 });
 
-// Initialize clients with latest models - DUAL LLM POWER! 🚀
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// AWS Bedrock Client (optimized for speed)
-const bedrockClient = new BedrockRuntimeClient({
-  region: process.env.AWS_REGION || "us-east-1",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  },
-  maxAttempts: 2, // Reduce retry attempts for speed
-  requestHandler: {
-    connectionTimeout: 5000, // 5s connection timeout
-    socketTimeout: 15000, // 15s socket timeout
-  },
-});
+// Initialize Google Generative AI client for Gemini 2.5 Flash
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
-// Use the latest Gemini Embedding model for maximum accuracy
+// Use Google Embedding API with GOOGLE_EMBEDDING_KEY for Gemini embeddings
 const embeddings = new GoogleGenerativeAIEmbeddings({
-  apiKey: process.env.GOOGLE_API_KEY,
+  apiKey: process.env.GOOGLE_EMBEDDING_KEY,
   model: "text-embedding-004", // Latest stable model
-  // Alternative: "gemini-embedding" for experimental higher accuracy
 });
 
 // Redis client with optimized connection pooling
@@ -85,23 +65,21 @@ const redisClient = redis.createClient({
 });
 redisClient.connect().catch(console.error);
 
-// Enhanced in-memory stores with TTL
 const vectorStores = new Map();
 const textCache = new Map();
 const answerCache = new Map();
 const embeddingCache = new Map();
 
 // Ultra-optimized processor with latest models
-class UltraFastAccurateProcessor {
+class LLMgobrr {
   constructor() {
-    // Optimized chunking for better search precision and accuracy balance
     this.textSplitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 1200, // Smaller chunks for better precision
-      chunkOverlap: 300, // Higher overlap to ensure important info isn't split
+      chunkSize: 1200, // smaller chunks for better precision
+      chunkOverlap: 300, // higher overlap to ensure important info isn't split
       separators: ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""],
     });
 
-    // Connection pool for parallel processing
+    // connection pool for parallel processing
     this.httpAgent = new (require("http").Agent)({
       keepAlive: true,
       maxSockets: 100,
@@ -117,27 +95,25 @@ class UltraFastAccurateProcessor {
   }
 
   generateKeywordVariations(question) {
-    // Simple, universal keyword extraction for any document type
     const variations = [];
     const lowerQuestion = question.toLowerCase();
 
-    // Extract key words (3+ characters) and create simple variations
+    // extract key words (3+ characters) and create simple variations
     const keyWords = lowerQuestion
-      .replace(/[^\w\s]/g, " ") // Remove punctuation
+      .replace(/[^\w\s]/g, " ") // remove punctuation
       .split(/\s+/)
-      .filter((word) => word.length > 2) // Only meaningful words
-      .slice(0, 5); // Limit to top 5 keywords
+      .filter((word) => word.length > 2) //  meaningful words
+      .slice(0, 5); // limit to top 5 keywords
 
-    // Create variations by combining keywords
+    // create variations by combining keywords
     if (keyWords.length > 1) {
-      variations.push(keyWords.join(" ")); // All keywords together
-      variations.push(keyWords.slice(0, 3).join(" ")); // First 3 keywords
+      variations.push(keyWords.join(" ")); 
+      variations.push(keyWords.slice(0, 3).join(" ")); 
     }
 
-    // Add the original question as fallback
     variations.push(question);
 
-    return variations.slice(0, 2); // Just 2 simple variations max
+    return variations.slice(0, 2); 
   }
 
   async downloadPDF(url) {
@@ -145,12 +121,10 @@ class UltraFastAccurateProcessor {
     const pdfFileName = `pdf_${urlHash}.pdf`;
     const pdfFilePath = path.join(__dirname, "temp", pdfFileName);
 
-    // Ensure temp directory exists
     if (!fs.existsSync(path.join(__dirname, "temp"))) {
       fs.mkdirSync(path.join(__dirname, "temp"), { recursive: true });
     }
 
-    // Multi-level caching check
     if (textCache.has(urlHash)) {
       return {
         text: textCache.get(urlHash),
@@ -175,7 +149,6 @@ class UltraFastAccurateProcessor {
     console.log(`⏳ Downloading PDF: ${url.substring(0, 50)}...`);
     const startTime = Date.now();
 
-    // Enhanced download with retry logic
     let retries = 3;
     let response;
 
@@ -222,24 +195,22 @@ class UltraFastAccurateProcessor {
     });
 
     console.log(
-      `✅ Downloaded in ${Date.now() - startTime}ms, size: ${(
+      `Downloaded in ${Date.now() - startTime}ms, size: ${(
         buffer.length /
         1024 /
         1024
       ).toFixed(2)}MB`
     );
 
-    // Save PDF to temp folder
     try {
       fs.writeFileSync(pdfFilePath, buffer);
-      console.log(`💾 PDF saved to: ${pdfFilePath}`);
+      console.log(`PDF saved to: ${pdfFilePath}`);
     } catch (saveError) {
       console.warn(
-        `⚠️ Failed to save PDF to temp folder: ${saveError.message}`
+        `Failed to save PDF to temp folder: ${saveError.message}`
       );
     }
 
-    // Enhanced PDF parsing with better error handling
     const parseStart = Date.now();
     const data = await pdfParse(buffer, {
       max: 0,
@@ -249,16 +220,15 @@ class UltraFastAccurateProcessor {
     });
 
     console.log(
-      `✅ Parsed PDF in ${Date.now() - parseStart}ms, ${
+      `Parsed PDF in ${Date.now() - parseStart}ms, ${
         data.numpages
       } pages, ${(data.text.length / 1000).toFixed(1)}k chars`
     );
 
-    // Enhanced caching with compression
     textCache.set(urlHash, data.text);
     try {
       const compressed = require("zlib").gzipSync(data.text).toString("base64");
-      await redisClient.setEx(`pdf:${urlHash}`, 14400, compressed); // 4 hour cache
+      await redisClient.setEx(`pdf:${urlHash}`, 14400, compressed); 
     } catch (e) {
       console.warn("Redis cache write failed:", e.message);
     }
@@ -278,7 +248,6 @@ class UltraFastAccurateProcessor {
     );
     const startTime = Date.now();
 
-    // Enhanced text preprocessing for better searchability
     const preprocessedText = this.preprocessText(text);
 
     // Create multiple granular chunks for better search precision
@@ -326,21 +295,16 @@ class UltraFastAccurateProcessor {
 
   async answerQuestions(questions, vectorStore, contentHash) {
     console.log(
-      `🚀 Processing ${questions.length} questions with GROQ BATCH POWER!`
+      `Processing ${questions.length} questions`
     );
     const startTime = Date.now();
-
-    // BATCH EVERYTHING TO GROQ for maximum speed and simplicity
-    console.log(
-      `⚡ Batch processing ALL ${questions.length} questions with Groq for blazing speed!`
-    );
 
     const allQuestions = questions.map((question, index) => ({
       question,
       originalIndex: index,
     }));
 
-    const results = await this.processQuestionsWithGroqBatch(
+    const results = await this.processQuestionsWithGeminiBatch(
       allQuestions,
       vectorStore,
       contentHash
@@ -348,11 +312,109 @@ class UltraFastAccurateProcessor {
     const answers = results.map((r) => r.answer);
 
     console.log(
-      `✅ All ${questions.length} questions answered in ${
+      `All ${questions.length} questions answered in ${
         Date.now() - startTime
-      }ms using GROQ BATCH PROCESSING!`
+      }ms`
     );
     return answers;
+  }
+
+  async processQuestionsWithGeminiBatch(questions, vectorStore, contentHash) {
+    console.log(
+      `Processing ${questions.length} questions`
+    );
+
+    const batchPromises = questions.map(async ({ question, originalIndex }) => {
+      const cacheKey = `answer:${contentHash}:${question}`;
+
+      if (answerCache.has(cacheKey)) {
+        console.log(`Cache hit for question ${originalIndex + 1}`);
+        return { originalIndex, answer: answerCache.get(cacheKey) };
+      }
+
+      try {
+        const context = await this.getEnhancedContext(question, vectorStore);
+        const prompt = this.buildPrompt(question, context);
+
+        let answer;
+        try {
+          const model = genAI.getGenerativeModel({
+            model: "gemini-2.5-flash",
+            generationConfig: {
+              temperature: 0.05,
+              maxOutputTokens: 400,
+              topP: 0.85,
+              responseMimeType: "application/json",
+            },
+          });
+
+          const result = await model.generateContent(prompt);
+          const responseText = result.response.text();
+          answer = this.parseResponse(responseText);
+
+          console.log(`✅ Gemini answered question ${originalIndex + 1}`);
+        } catch (geminiError) {
+          console.warn(
+            `⚠️ Gemini failed for question ${
+              originalIndex + 1
+            }, falling back to Groq...`
+          );
+
+          // Fallback to Groq
+          const groqModels = [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-70b-versatile",
+            "llama-3.1-8b-instant",
+          ];
+
+          let response;
+          for (const model of groqModels) {
+            try {
+              response = await groq.chat.completions.create({
+                messages: [{ role: "user", content: prompt }],
+                model: model,
+                temperature: 0.05,
+                max_completion_tokens: 400,
+                response_format: { type: "json_object" },
+                top_p: 0.85,
+                frequency_penalty: 0.1,
+                presence_penalty: 0.1,
+              });
+              break;
+            } catch (modelError) {
+              console.warn(`Groq model ${model} failed, trying next...`);
+              continue;
+            }
+          }
+
+          if (response) {
+            answer = this.parseResponse(response.choices[0].message.content);
+            console.log(
+              `✅ Groq fallback answered question ${originalIndex + 1}`
+            );
+          } else {
+            throw new Error("All models failed");
+          }
+        }
+
+        // Cache the answer
+        answerCache.set(cacheKey, answer);
+        return { originalIndex, answer };
+      } catch (error) {
+        console.error(
+          `❌ Error processing question ${originalIndex + 1}:`,
+          error
+        );
+        return {
+          originalIndex,
+          answer: "Sorry, I encountered an error processing this question.",
+        };
+      }
+    });
+
+    // Wait for all questions to be processed in parallel
+    const results = await Promise.all(batchPromises);
+    return results;
   }
 
   async processQuestionsWithGroqBatch(questions, vectorStore, contentHash) {
@@ -429,26 +491,6 @@ class UltraFastAccurateProcessor {
     return results;
   }
 
-  splitQuestionsBetweenProviders(questions) {
-    const groq = [];
-    const bedrock = [];
-
-    // Give 60% to Groq (faster), 40% to Bedrock (more accurate)
-    questions.forEach((question, index) => {
-      const questionWithIndex = { question, originalIndex: index };
-
-      if (index % 5 < 3) {
-        // 0,1,2 go to Groq (60%)
-        groq.push(questionWithIndex);
-      } else {
-        // 3,4 go to Bedrock (40%)
-        bedrock.push(questionWithIndex);
-      }
-    });
-
-    return { groq, bedrock };
-  }
-
   async processQuestionsWithGroq(questionObjects, vectorStore, contentHash) {
     if (questionObjects.length === 0) return [];
 
@@ -518,116 +560,6 @@ class UltraFastAccurateProcessor {
     return results;
   }
 
-  async processQuestionsWithBedrockFast(
-    questionObjects,
-    vectorStore,
-    contentHash
-  ) {
-    if (questionObjects.length === 0) return [];
-
-    console.log(
-      `⚡ AWS Bedrock FAST processing ${questionObjects.length} questions...`
-    );
-    const results = [];
-
-    // Process multiple questions in parallel for speed
-    const parallelPromises = questionObjects.map(
-      async ({ question, originalIndex }) => {
-        const cacheKey = `bedrock:${contentHash}:${crypto
-          .createHash("sha256")
-          .update(question)
-          .digest("hex")}`;
-
-        if (answerCache.has(cacheKey)) {
-          return { originalIndex, answer: answerCache.get(cacheKey) };
-        }
-
-        try {
-          const context = await this.getEnhancedContext(question, vectorStore);
-
-          // Optimized prompt for faster processing
-          const prompt = `Extract precise answer from document.
-
-CONTEXT: ${context.substring(0, 2000)}
-QUESTION: ${question}
-
-RULES:
-1. Extract exact info from document
-2. Include numbers, dates, conditions
-3. 1-2 sentences max
-4. JSON format only
-
-JSON: {"answer": "document answer"}`;
-
-          const bedrockPayload = {
-            prompt: prompt,
-            max_gen_len: 200, // Reduced for speed
-            temperature: 0.05, // Very low for consistency
-            top_p: 0.9,
-          };
-
-          const command = new InvokeModelCommand({
-            modelId: "meta.llama3-8b-instruct-v1:0",
-            body: JSON.stringify(bedrockPayload),
-            contentType: "application/json",
-          });
-
-          const response = await bedrockClient.send(command);
-          const responseBody = JSON.parse(
-            new TextDecoder().decode(response.body)
-          );
-
-          let answer = "Unable to extract answer";
-
-          if (responseBody.generation) {
-            const responseText = responseBody.generation;
-            try {
-              const parsed = JSON.parse(responseText);
-              answer = parsed.answer || responseText;
-            } catch {
-              // Fast fallback parsing
-              const jsonMatch = responseText.match(/\{[^}]*"answer"[^}]*\}/);
-              if (jsonMatch) {
-                try {
-                  const parsed = JSON.parse(jsonMatch[0]);
-                  answer = parsed.answer || responseText.substring(0, 200);
-                } catch {
-                  answer = responseText.substring(0, 200);
-                }
-              } else {
-                const answerMatch = responseText.match(
-                  /"answer"\s*:\s*"([^"]+)"/
-                );
-                answer = answerMatch
-                  ? answerMatch[1]
-                  : responseText.substring(0, 200);
-              }
-            }
-          }
-
-          answerCache.set(cacheKey, answer);
-          return { originalIndex, answer };
-        } catch (error) {
-          console.error(
-            `Bedrock error for question ${originalIndex}:`,
-            error.message
-          );
-          return {
-            originalIndex,
-            answer: "AWS Bedrock processing error occurred",
-          };
-        }
-      }
-    );
-
-    // Wait for all parallel requests to complete
-    const parallelResults = await Promise.all(parallelPromises);
-    results.push(...parallelResults);
-
-    console.log(`✅ AWS Bedrock FAST completed ${results.length} questions`);
-    return results;
-  }
-
   async getEnhancedContext(question, vectorStore) {
     // Multi-stage search for comprehensive coverage
     let docs = await vectorStore.similaritySearch(question, 8);
@@ -654,24 +586,24 @@ JSON: {"answer": "document answer"}`;
   buildPrompt(question, context) {
     return `You are an expert document analyst. Extract the precise answer from the document context provided.
 
-DOCUMENT CONTEXT:
-${context.substring(0, 3000)}
+  DOCUMENT CONTEXT:
+  ${context.substring(0, 3000)}
 
-QUESTION: ${question}
+  QUESTION: ${question}
 
-CRITICAL INSTRUCTIONS:
-1. Extract the EXACT information from the document - do not say "context doesn't contain enough information" unless truly absent
-2. Look for specific numbers, dates, percentages, conditions, and definitions
-3. If you find partial information, provide what's available with specific details
-4. Include specific terms, timeframes, and conditions mentioned in the document
-5. For definitions, provide the complete definition as stated
-6. Be comprehensive but concise - include all relevant details from the document
-7. Write answers in clear, human-readable format with proper punctuation and grammar
-8. Focus on factual information directly from the document
+  CRITICAL INSTRUCTIONS:
+  1. Extract the EXACT information from the document - do not say "context doesn't contain enough information" unless truly absent
+  2. Look for specific numbers, dates, percentages, conditions, and definitions
+  3. If you find partial information, provide what's available with specific details
+  4. Include specific terms, timeframes, and conditions mentioned in the document
+  5. For definitions, provide the complete definition as stated
+  6. Be comprehensive but concise - include all relevant details from the document
+  7. Write answers in clear, human-readable format with proper punctuation and grammar
+  8. Focus on factual information directly from the document
 
-FORMAT: Respond with JSON: {"answer": "detailed answer with specific information from document"}
+  FORMAT: Respond with JSON: {"answer": "detailed answer with specific information from document"}
 
-ANSWER:`;
+  ANSWER:`;
   }
 
   parseResponse(responseContent) {
@@ -696,7 +628,7 @@ ANSWER:`;
   }
 }
 
-const processor = new UltraFastAccurateProcessor();
+const processor = new LLMgobrr();
 
 // SINGLE OPTIMIZED ENDPOINT with enhanced accuracy
 app.post("/hackrx/run", async (req, res) => {
@@ -841,19 +773,19 @@ app.get("/health", (req, res) => {
       embedding_cache: embeddingCache.size,
     },
     providers: {
-      embedding: "Google text-embedding-004",
+      embedding: "Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)",
       llm_providers: {
-        groq: "llama-3.3-70b-versatile (primary - fast)",
-        aws_bedrock: "meta.llama3-8b-instruct-v1:0 (secondary - accurate)",
+        primary: "Google Gemini 2.5 Flash (GOOGLE_API_KEY)",
+        fallback: "Groq llama-3.3-70b-versatile",
       },
-      parallel_processing: "SMART DUAL - Groq Only for <6 questions! 🚀",
-      distribution: "60% Groq (fast) + 40% Bedrock (accurate)",
+      architecture: "Gemini Primary + Groq Fallback 🚀",
     },
     features: [
-      "Triple parallel LLM processing",
+      "Gemini 2.5 Flash primary processing",
+      "Groq fallback for reliability",
       "Enhanced caching",
       "Error recovery",
-      "Load balancing across providers",
+      "Parallel processing",
     ],
   });
 });
@@ -880,17 +812,15 @@ app.post("/cache/clear", async (req, res) => {
 
 // Start server with optimized settings
 const server = app.listen(port, () => {
-  console.log(`🚀 SMART DUAL-POWERED AI Server running on port ${port}`);
-  console.log(
-    `⚡ INTELLIGENT PROCESSING: Groq (speed) + AWS Bedrock (accuracy)`
-  );
-  console.log(`🧠 SMART LOGIC: <6 questions = Groq ONLY for max speed!`);
+  console.log(`🚀 GEMINI + GROQ AI Server running on port ${port}`);
+  console.log(`⚡ PRIMARY: Google Gemini 2.5 Flash (accuracy + speed)`);
+  console.log(`🔄 FALLBACK: Groq llama-3.3-70b-versatile (reliability)`);
   console.log(`📊 Target: <5s for small batches, <15s for large batches`);
-  console.log(`🔧 Models: Google Embeddings + Optimized Dual LLM`);
   console.log(
-    `🌟 Features: Smart distribution, parallel processing, speed optimization`
+    `🔧 Embeddings: Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)`
   );
-  console.log(`� INTELLIGENCE MEETS SPEED: ACTIVATED!`);
+  console.log(`🌟 Features: Parallel processing, smart fallback, caching`);
+  console.log(`🎯 GEMINI POWERED: Maximum Accuracy + Speed!`);
 });
 
 // Enhanced server settings
