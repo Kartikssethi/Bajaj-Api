@@ -19,7 +19,6 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 
-
 app.use((req, res, next) => {
   if (
     req.method === "POST" &&
@@ -46,7 +45,7 @@ app.use((req, res, next) => {
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // Initialize Google Generative AI client for Gemini 2.5 Flash
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Use Google Embedding API with GOOGLE_EMBEDDING_KEY for Gemini embeddings
 const embeddings = new GoogleGenerativeAIEmbeddings({
@@ -70,7 +69,10 @@ const textCache = new Map();
 const answerCache = new Map();
 const embeddingCache = new Map();
 
-// Ultra-optimized processor with latest models
+// Global request counter to track alternating pattern
+let requestCounter = 0;
+
+// Ultra-optimized processor with alternating models
 class LLMgobrr {
   constructor() {
     this.textSplitter = new RecursiveCharacterTextSplitter({
@@ -107,13 +109,13 @@ class LLMgobrr {
 
     // create variations by combining keywords
     if (keyWords.length > 1) {
-      variations.push(keyWords.join(" ")); 
-      variations.push(keyWords.slice(0, 3).join(" ")); 
+      variations.push(keyWords.join(" "));
+      variations.push(keyWords.slice(0, 3).join(" "));
     }
 
     variations.push(question);
 
-    return variations.slice(0, 2); 
+    return variations.slice(0, 2);
   }
 
   async downloadPDF(url) {
@@ -206,9 +208,7 @@ class LLMgobrr {
       fs.writeFileSync(pdfFilePath, buffer);
       console.log(`PDF saved to: ${pdfFilePath}`);
     } catch (saveError) {
-      console.warn(
-        `Failed to save PDF to temp folder: ${saveError.message}`
-      );
+      console.warn(`Failed to save PDF to temp folder: ${saveError.message}`);
     }
 
     const parseStart = Date.now();
@@ -220,15 +220,15 @@ class LLMgobrr {
     });
 
     console.log(
-      `Parsed PDF in ${Date.now() - parseStart}ms, ${
-        data.numpages
-      } pages, ${(data.text.length / 1000).toFixed(1)}k chars`
+      `Parsed PDF in ${Date.now() - parseStart}ms, ${data.numpages} pages, ${(
+        data.text.length / 1000
+      ).toFixed(1)}k chars`
     );
 
     textCache.set(urlHash, data.text);
     try {
       const compressed = require("zlib").gzipSync(data.text).toString("base64");
-      await redisClient.setEx(`pdf:${urlHash}`, 14400, compressed); 
+      await redisClient.setEx(`pdf:${urlHash}`, 14400, compressed);
     } catch (e) {
       console.warn("Redis cache write failed:", e.message);
     }
@@ -293,9 +293,9 @@ class LLMgobrr {
     );
   }
 
-  async answerQuestions(questions, vectorStore, contentHash) {
+  async answerQuestions(questions, vectorStore, contentHash, requestId) {
     console.log(
-      `Processing ${questions.length} questions`
+      `Processing ${questions.length} questions for request ${requestId}`
     );
     const startTime = Date.now();
 
@@ -304,123 +304,91 @@ class LLMgobrr {
       originalIndex: index,
     }));
 
-    const results = await this.processQuestionsWithGeminiBatch(
-      allQuestions,
-      vectorStore,
-      contentHash
+    // Determine which model to use based on request counter
+    const useGemini = requestCounter % 2 === 0;
+    console.log(
+      `🎯 Request #${requestCounter + 1}: Using ${
+        useGemini ? "GEMINI" : "GROQ"
+      } for processing`
     );
+
+    const results = useGemini
+      ? await this.processQuestionsWithGemini(
+          allQuestions,
+          vectorStore,
+          contentHash
+        )
+      : await this.processQuestionsWithGroq(
+          allQuestions,
+          vectorStore,
+          contentHash
+        );
+
     const answers = results.map((r) => r.answer);
 
     console.log(
       `All ${questions.length} questions answered in ${
         Date.now() - startTime
-      }ms`
+      }ms using ${useGemini ? "GEMINI" : "GROQ"}`
     );
     return answers;
   }
+  // PASTE THIS CORRECTED FUNCTION INTO YOUR CODE
+  async processQuestionsWithGemini(questions, vectorStore, contentHash) {
+    console.log(`🤖 Processing ${questions.length} questions with GEMINI`);
 
-  async processQuestionsWithGeminiBatch(questions, vectorStore, contentHash) {
-    console.log(
-      `Processing ${questions.length} questions`
-    );
+    // OPTIMIZATION: Initialize the model once for the entire batch.
+    const model = genAI.getGenerativeModel({
+      // FIX 1: Use the correct, latest public model name.
+      model: "gemini-2.5-flash-lite",
+      generationConfig: {
+        temperature: 0.05,
+        topP: 0.85,
+        response_mime_type: "application/json",
+      },
+    });
 
     const batchPromises = questions.map(async ({ question, originalIndex }) => {
-      const cacheKey = `answer:${contentHash}:${question}`;
-
+      const cacheKey = `gemini:${contentHash}:${question}`;
       if (answerCache.has(cacheKey)) {
-        console.log(`Cache hit for question ${originalIndex + 1}`);
+        console.log(`💾 Gemini cache hit for question ${originalIndex + 1}`);
         return { originalIndex, answer: answerCache.get(cacheKey) };
       }
-
       try {
         const context = await this.getEnhancedContext(question, vectorStore);
         const prompt = this.buildPrompt(question, context);
 
-        let answer;
-        try {
-          const model = genAI.getGenerativeModel({
-            model: "gemini-2.5-flash",
-            generationConfig: {
-              temperature: 0.05,
-              maxOutputTokens: 400,
-              topP: 0.85,
-              responseMimeType: "application/json",
-            },
-          });
+        const result = await model.generateContent(prompt);
+        // The response from the model when in JSON mode is accessed directly.
+        const responseText = result.response.text();
+        const answer = this.parseResponse(responseText);
 
-          const result = await model.generateContent(prompt);
-          const responseText = result.response.text();
-          answer = this.parseResponse(responseText);
-
-          console.log(`✅ Gemini answered question ${originalIndex + 1}`);
-        } catch (geminiError) {
-          console.warn(
-            `⚠️ Gemini failed for question ${
-              originalIndex + 1
-            }, falling back to Groq...`
-          );
-
-          // Fallback to Groq
-          const groqModels = [
-            "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "llama-3.1-8b-instant",
-          ];
-
-          let response;
-          for (const model of groqModels) {
-            try {
-              response = await groq.chat.completions.create({
-                messages: [{ role: "user", content: prompt }],
-                model: model,
-                temperature: 0.05,
-                max_completion_tokens: 400,
-                response_format: { type: "json_object" },
-                top_p: 0.85,
-                frequency_penalty: 0.1,
-                presence_penalty: 0.1,
-              });
-              break;
-            } catch (modelError) {
-              console.warn(`Groq model ${model} failed, trying next...`);
-              continue;
-            }
-          }
-
-          if (response) {
-            answer = this.parseResponse(response.choices[0].message.content);
-            console.log(
-              `✅ Groq fallback answered question ${originalIndex + 1}`
-            );
-          } else {
-            throw new Error("All models failed");
-          }
-        }
-
+        console.log(`✅ Gemini answered question ${originalIndex + 1}`);
         // Cache the answer
         answerCache.set(cacheKey, answer);
         return { originalIndex, answer };
       } catch (error) {
         console.error(
-          `❌ Error processing question ${originalIndex + 1}:`,
-          error
+          `❌ Gemini error processing question ${originalIndex + 1}:`,
+          error.message
         );
+        // Provide more detailed error for debugging
+        const errorMessage = error.response
+          ? JSON.stringify(error.response.data)
+          : error.message;
         return {
           originalIndex,
-          answer: "Sorry, I encountered an error processing this question.",
+          answer: `Sorry, I encountered an error processing this question with Gemini. Details: ${errorMessage}`,
         };
       }
     });
-
     // Wait for all questions to be processed in parallel
     const results = await Promise.all(batchPromises);
     return results;
   }
 
-  async processQuestionsWithGroqBatch(questions, vectorStore, contentHash) {
-    console.log(
-      `🔥 Processing ${questions.length} questions with Groq parallel batch processing...`
-    );
+  async processQuestionsWithGroq(questions, vectorStore, contentHash) {
+    console.log(`🔥 Processing ${questions.length} questions with GROQ`);
 
     const groqModels = [
       "llama-3.3-70b-versatile",
@@ -430,11 +398,11 @@ class LLMgobrr {
 
     // Process all questions in parallel for maximum speed
     const batchPromises = questions.map(async ({ question, originalIndex }) => {
-      const cacheKey = `answer:${contentHash}:${question}`;
+      const cacheKey = `groq:${contentHash}:${question}`;
 
       // Check cache first
       if (answerCache.has(cacheKey)) {
-        console.log(`💾 Cache hit for question ${originalIndex + 1}`);
+        console.log(`💾 Groq cache hit for question ${originalIndex + 1}`);
         return { originalIndex, answer: answerCache.get(cacheKey) };
       }
 
@@ -469,94 +437,26 @@ class LLMgobrr {
           throw new Error("All Groq models failed");
         }
 
-        const answer = JSON.parse(response.choices[0].message.content).answer;
+        const answer = this.parseResponse(response.choices[0].message.content);
         answerCache.set(cacheKey, answer);
 
         console.log(`✅ Groq answered question ${originalIndex + 1}`);
         return { originalIndex, answer };
       } catch (error) {
         console.error(
-          `❌ Error processing question ${originalIndex + 1}:`,
-          error
+          `❌ Groq error processing question ${originalIndex + 1}:`,
+          error.message
         );
         return {
           originalIndex,
-          answer: "Sorry, I encountered an error processing this question.",
+          answer:
+            "Sorry, I encountered an error processing this question with Groq.",
         };
       }
     });
 
     // Wait for all questions to be processed in parallel
     const results = await Promise.all(batchPromises);
-    return results;
-  }
-
-  async processQuestionsWithGroq(questionObjects, vectorStore, contentHash) {
-    if (questionObjects.length === 0) return [];
-
-    console.log(`🔥 Groq processing ${questionObjects.length} questions...`);
-    const results = [];
-
-    // Groq models optimized for speed and accuracy
-    const groqModels = [
-      "llama-3.1-8b-instant",
-      "llama-3.1-70b-versatile",
-      "llama-3.1-8b-instant",
-    ];
-
-    for (const { question, originalIndex } of questionObjects) {
-      const cacheKey = `groq:${contentHash}:${crypto
-        .createHash("sha256")
-        .update(question)
-        .digest("hex")}`;
-
-      if (answerCache.has(cacheKey)) {
-        results.push({ originalIndex, answer: answerCache.get(cacheKey) });
-        continue;
-      }
-
-      try {
-        const context = await this.getEnhancedContext(question, vectorStore);
-        const prompt = this.buildPrompt(question, context);
-
-        let response;
-        for (const model of groqModels) {
-          try {
-            response = await groq.chat.completions.create({
-              messages: [{ role: "user", content: prompt }],
-              model: model,
-              temperature: 0.05,
-              max_completion_tokens: 400,
-              response_format: { type: "json_object" },
-              top_p: 0.85,
-              frequency_penalty: 0.1,
-              presence_penalty: 0.1,
-            });
-            break;
-          } catch (modelError) {
-            console.warn(`Groq model ${model} failed, trying next...`);
-            continue;
-          }
-        }
-
-        const answer = this.parseResponse(
-          response?.choices[0]?.message?.content
-        );
-        answerCache.set(cacheKey, answer);
-        results.push({ originalIndex, answer });
-      } catch (error) {
-        console.error(
-          `Groq error for question ${originalIndex}:`,
-          error.message
-        );
-        results.push({
-          originalIndex,
-          answer: "Groq processing error occurred",
-        });
-      }
-    }
-
-    console.log(`✅ Groq completed ${results.length} questions`);
     return results;
   }
 
@@ -586,24 +486,24 @@ class LLMgobrr {
   buildPrompt(question, context) {
     return `You are an expert document analyst. Extract the precise answer from the document context provided.
 
-  DOCUMENT CONTEXT:
-  ${context.substring(0, 3000)}
+DOCUMENT CONTEXT:
+${context.substring(0, 3000)}
 
-  QUESTION: ${question}
+QUESTION: ${question}
 
-  CRITICAL INSTRUCTIONS:
-  1. Extract the EXACT information from the document - do not say "context doesn't contain enough information" unless truly absent
-  2. Look for specific numbers, dates, percentages, conditions, and definitions
-  3. If you find partial information, provide what's available with specific details
-  4. Include specific terms, timeframes, and conditions mentioned in the document
-  5. For definitions, provide the complete definition as stated
-  6. Be comprehensive but concise - include all relevant details from the document
-  7. Write answers in clear, human-readable format with proper punctuation and grammar
-  8. Focus on factual information directly from the document
+CRITICAL INSTRUCTIONS:
+1. Extract the EXACT information from the document - do not say "context doesn't contain enough information" unless truly absent
+2. Look for specific numbers, dates, percentages, conditions, and definitions
+3. If you find partial information, provide what's available with specific details
+4. Include specific terms, timeframes, and conditions mentioned in the document
+5. For definitions, provide the complete definition as stated
+6. Be comprehensive but concise - include all relevant details from the document
+7. Write answers in clear, human-readable format with proper punctuation and grammar
+8. Focus on factual information directly from the document
 
-  FORMAT: Respond with JSON: {"answer": "detailed answer with specific information from document"}
+FORMAT: Respond with JSON: {"answer": "detailed answer with specific information from document"}
 
-  ANSWER:`;
+ANSWER:`;
   }
 
   parseResponse(responseContent) {
@@ -630,7 +530,7 @@ class LLMgobrr {
 
 const processor = new LLMgobrr();
 
-// SINGLE OPTIMIZED ENDPOINT with enhanced accuracy
+// SINGLE OPTIMIZED ENDPOINT with alternating models
 app.post("/hackrx/run", async (req, res) => {
   const startTime = Date.now();
   const requestId = `req_${Date.now()}_${Math.random()
@@ -695,12 +595,17 @@ app.post("/hackrx/run", async (req, res) => {
       } in ${vectorTime}ms`
     );
 
-    // Step 3: Answer questions with high accuracy
+    // Step 3: Answer questions with alternating models
     const answers = await processor.answerQuestions(
       questions,
       store,
-      contentHash
+      contentHash,
+      requestId
     );
+
+    // Increment request counter for next alternation
+    requestCounter++;
+
     const totalTime = Date.now() - startTime;
 
     // Enhanced performance metrics
@@ -766,6 +671,8 @@ app.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     memory: process.memoryUsage(),
+    request_counter: requestCounter,
+    next_model: requestCounter % 2 === 0 ? "GEMINI" : "GROQ",
     caches: {
       text_cache: textCache.size,
       vector_stores: vectorStores.size,
@@ -775,17 +682,17 @@ app.get("/health", (req, res) => {
     providers: {
       embedding: "Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)",
       llm_providers: {
-        primary: "Google Gemini 2.5 Flash (GOOGLE_API_KEY)",
-        fallback: "Groq llama-3.3-70b-versatile",
+        alternating: "Gemini 2.5 Flash ↔ Groq llama-3.3-70b-versatile",
+        pattern: "Gemini → Groq → Gemini → Groq...",
       },
-      architecture: "Gemini Primary + Groq Fallback 🚀",
+      architecture: "Alternating Gemini + Groq Processing 🔄",
     },
     features: [
-      "Gemini 2.5 Flash primary processing",
-      "Groq fallback for reliability",
-      "Enhanced caching",
-      "Error recovery",
+      "Alternating Gemini 2.5 Flash and Groq processing",
+      "Enhanced caching per model",
+      "Request-based alternation",
       "Parallel processing",
+      "Model-specific error handling",
     ],
   });
 });
@@ -798,8 +705,10 @@ app.post("/cache/clear", async (req, res) => {
     answerCache.clear();
     embeddingCache.clear();
     await redisClient.flushAll();
+    // Reset request counter
+    requestCounter = 0;
     res.json({
-      message: "All caches cleared successfully",
+      message: "All caches cleared successfully and request counter reset",
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -812,15 +721,21 @@ app.post("/cache/clear", async (req, res) => {
 
 // Start server with optimized settings
 const server = app.listen(port, () => {
-  console.log(`🚀 GEMINI + GROQ AI Server running on port ${port}`);
-  console.log(`⚡ PRIMARY: Google Gemini 2.5 Flash (accuracy + speed)`);
-  console.log(`🔄 FALLBACK: Groq llama-3.3-70b-versatile (reliability)`);
+  console.log(`🚀 ALTERNATING GEMINI + GROQ AI Server running on port ${port}`);
+  console.log(
+    `🔄 ALTERNATING: Gemini 2.5 Flash ↔ Groq llama-3.3-70b-versatile`
+  );
+  console.log(
+    `🎯 Pattern: Request 1→Gemini, Request 2→Groq, Request 3→Gemini...`
+  );
   console.log(`📊 Target: <5s for small batches, <15s for large batches`);
   console.log(
     `🔧 Embeddings: Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)`
   );
-  console.log(`🌟 Features: Parallel processing, smart fallback, caching`);
-  console.log(`🎯 GEMINI POWERED: Maximum Accuracy + Speed!`);
+  console.log(
+    `🌟 Features: Alternating processing, smart caching, parallel execution`
+  );
+  console.log(`⚡ ALTERNATING POWER: Maximum Diversity + Performance!`);
 });
 
 // Enhanced server settings
