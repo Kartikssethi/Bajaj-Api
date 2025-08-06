@@ -307,28 +307,26 @@ class LLMgobrr {
     // Determine which model to use based on request counter
     const useGemini = requestCounter % 2 === 0;
     console.log(
-      `🎯 Request #${requestCounter + 1}: Using ${
-        useGemini ? "GEMINI" : "GROQ"
+      `🎯 Request #${requestCounter + 1}: Using ${useGemini ? "GEMINI" : "GROQ"
       } for processing`
     );
 
     const results = useGemini
       ? await this.processQuestionsWithGemini(
-          allQuestions,
-          vectorStore,
-          contentHash
-        )
+        allQuestions,
+        vectorStore,
+        contentHash
+      )
       : await this.processQuestionsWithGroq(
-          allQuestions,
-          vectorStore,
-          contentHash
-        );
+        allQuestions,
+        vectorStore,
+        contentHash
+      );
 
     const answers = results.map((r) => r.answer);
 
     console.log(
-      `All ${questions.length} questions answered in ${
-        Date.now() - startTime
+      `All ${questions.length} questions answered in ${Date.now() - startTime
       }ms using ${useGemini ? "GEMINI" : "GROQ"}`
     );
     return answers;
@@ -426,8 +424,7 @@ class LLMgobrr {
             break;
           } catch (error) {
             console.log(
-              `⚠️ Groq model ${model} failed for Q${
-                originalIndex + 1
+              `⚠️ Groq model ${model} failed for Q${originalIndex + 1
               }, trying next...`
             );
           }
@@ -558,6 +555,12 @@ app.post("/hackrx/run", async (req, res) => {
         error: "Too many questions: Maximum 100 questions per request",
       });
     }
+    let isBinFile = documents.toLowerCase().endsWith(".bin");
+    if (isBinFile) {
+      return res.status(400).json({
+        error: "Invalid request: '.bin' files are not supported",
+      });
+    }
 
     console.log(
       `🚀 [${requestId}] Processing ${questions.length} questions for document`
@@ -571,8 +574,7 @@ app.post("/hackrx/run", async (req, res) => {
     } = await processor.downloadPDF(documents);
     const downloadTime = Date.now() - startTime;
     console.log(
-      `📄 Text ${
-        textCached ? "loaded from cache" : "downloaded"
+      `📄 Text ${textCached ? "loaded from cache" : "downloaded"
       } in ${downloadTime}ms${filePath ? `, saved to: ${filePath}` : ""}`
     );
 
@@ -590,8 +592,7 @@ app.post("/hackrx/run", async (req, res) => {
     );
     const vectorTime = Date.now() - startTime;
     console.log(
-      `🔍 Vector store ${
-        storeCached ? "loaded from cache" : "created"
+      `🔍 Vector store ${storeCached ? "loaded from cache" : "created"
       } in ${vectorTime}ms`
     );
 
