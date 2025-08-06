@@ -11,6 +11,11 @@ const fs = require("fs");
 const path = require("path");
 const redis = require("redis");
 const crypto = require("crypto");
+const multer = require("multer");
+const mammoth = require("mammoth");
+const XLSX = require("xlsx");
+const Tesseract = require("tesseract.js");
+const sharp = require("sharp");
 require("dotenv").config();
 
 const app = express();
@@ -18,6 +23,49 @@ const port = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json({ limit: "100mb" }));
+
+// File upload configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = path.join(__dirname, "temp", "uploads");
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(null, file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname));
+  },
+});
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      "application/pdf",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/msword",
+      "application/vnd.ms-excel",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "image/jpeg",
+      "image/png",
+      "image/gif",
+      "image/bmp",
+      "image/tiff",
+    ];
+    
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported file type: ${file.mimetype}`), false);
+    }
+  },
+});
+
 
 app.use((req, res, next) => {
   if (
@@ -525,6 +573,171 @@ ANSWER:`;
   }
 }
 
+// High-performance file processor for multiple document types
+class FileProcessor {
+  constructor() {
+    this.textCache = new Map();
+    this.ocrCache = new Map();
+    this.processingCache = new Map();
+  }
+
+  async processFile(filePath, fileType) {
+    const fileHash = crypto.createHash("sha256").update(filePath).digest("hex");
+    const cacheKey = `${fileType}:${fileHash}`;
+
+    // Check cache first
+    if (this.textCache.has(cacheKey)) {
+      console.log(`📄 File content loaded from cache: ${path.basename(filePath)}`);
+      return this.textCache.get(cacheKey);
+    }
+
+    // Check if already processing
+    if (this.processingCache.has(cacheKey)) {
+      console.log(`⏳ File already being processed: ${path.basename(filePath)}`);
+      return this.processingCache.get(cacheKey);
+    }
+
+    console.log(`🔄 Processing ${fileType} file: ${path.basename(filePath)}`);
+    const startTime = Date.now();
+
+    // Create processing promise
+    const processingPromise = this.extractTextFromFile(filePath, fileType);
+    this.processingCache.set(cacheKey, processingPromise);
+
+    try {
+      const result = await processingPromise;
+      const processingTime = Date.now() - startTime;
+      
+      console.log(`✅ Processed ${fileType} in ${processingTime}ms: ${path.basename(filePath)}`);
+      
+      // Cache the result
+      this.textCache.set(cacheKey, result);
+      
+      // Clean up processing cache
+      this.processingCache.delete(cacheKey);
+      
+      return result;
+    } catch (error) {
+      this.processingCache.delete(cacheKey);
+      throw error;
+    }
+  }
+
+  async extractTextFromFile(filePath, fileType) {
+    switch (fileType) {
+      case "pdf":
+        return this.processPDF(filePath);
+      case "word":
+        return this.processWord(filePath);
+      case "excel":
+        return this.processExcel(filePath);
+      case "image":
+        return this.processImage(filePath);
+      default:
+        throw new Error(`Unsupported file type: ${fileType}`);
+    }
+  }
+
+  async processPDF(filePath) {
+    const buffer = fs.readFileSync(filePath);
+    const data = await pdfParse(buffer, {
+      max: 0,
+      version: "v1.10.100",
+      normalizeWhitespace: true,
+      disableCombineTextItems: false,
+    });
+    return data.text;
+  }
+
+  async processWord(filePath) {
+    const buffer = fs.readFileSync(filePath);
+    const result = await mammoth.extractRawText({ buffer });
+    return result.value;
+  }
+
+  async processExcel(filePath) {
+    const workbook = XLSX.readFile(filePath);
+    let allText = "";
+
+    // Process all sheets
+    for (const sheetName of workbook.SheetNames) {
+      const worksheet = workbook.Sheets[sheetName];
+      const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+      
+      // Convert sheet data to text
+      const sheetText = jsonData
+        .map(row => row.join(" | "))
+        .filter(row => row.trim().length > 0)
+        .join("\n");
+      
+      allText += `Sheet: ${sheetName}\n${sheetText}\n\n`;
+    }
+
+    return allText;
+  }
+
+  async processImage(filePath) {
+    const imageHash = crypto.createHash("sha256").update(filePath).digest("hex");
+    const ocrCacheKey = `ocr:${imageHash}`;
+
+    // Check OCR cache
+    if (this.ocrCache.has(ocrCacheKey)) {
+      return this.ocrCache.get(ocrCacheKey);
+    }
+
+    console.log(`🔍 Performing OCR on image: ${path.basename(filePath)}`);
+    
+    try {
+      // Preprocess image for better OCR accuracy
+      const processedImageBuffer = await sharp(filePath)
+        .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
+        .sharpen()
+        .normalize()
+        .png()
+        .toBuffer();
+
+      // Perform OCR with optimized settings
+      const result = await Tesseract.recognize(processedImageBuffer, 'eng', {
+        logger: m => {
+          if (m.status === 'recognizing text') {
+            console.log(`OCR Progress: ${Math.round(m.progress * 100)}%`);
+          }
+        },
+        errorHandler: (err) => {
+          console.warn(`OCR Warning: ${err.message}`);
+        }
+      });
+
+      const extractedText = result.data.text;
+      
+      // Cache OCR result
+      this.ocrCache.set(ocrCacheKey, extractedText);
+      
+      return extractedText;
+    } catch (error) {
+      console.error(`OCR Error for ${path.basename(filePath)}:`, error.message);
+      return `OCR processing failed: ${error.message}`;
+    }
+  }
+
+  getFileType(mimeType, filename) {
+    if (mimeType.includes("pdf")) return "pdf";
+    if (mimeType.includes("word") || filename.match(/\.(doc|docx)$/i)) return "word";
+    if (mimeType.includes("excel") || filename.match(/\.(xls|xlsx)$/i)) return "excel";
+    if (mimeType.includes("image")) return "image";
+    return "unknown";
+  }
+
+  clearCache() {
+    this.textCache.clear();
+    this.ocrCache.clear();
+    this.processingCache.clear();
+    console.log("🗑️ File processor cache cleared");
+  }
+}
+
+const fileProcessor = new FileProcessor();
+
 const processor = new LLMgobrr();
 
 // SINGLE OPTIMIZED ENDPOINT with alternating models
@@ -665,6 +878,135 @@ app.post("/hackrx/run", async (req, res) => {
   }
 });
 
+// NEW ENDPOINT: File upload and processing with support for Word, Excel, and Images
+app.post("/hackrx/upload", upload.single("file"), async (req, res) => {
+  const startTime = Date.now();
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        error: "No file uploaded",
+        message: "Please upload a file using the 'file' field",
+      });
+    }
+
+    const { questions } = req.body;
+    
+    if (!questions || !Array.isArray(questions) || questions.length === 0) {
+      return res.status(400).json({
+        error: "Invalid request: 'questions' must be a non-empty array",
+      });
+    }
+
+    if (questions.length > 100) {
+      return res.status(400).json({
+        error: "Too many questions: Maximum 100 questions per request",
+      });
+    }
+
+    console.log(`🚀 [${requestId}] Processing file: ${req.file.originalname}`);
+    console.log(`📁 File type: ${req.file.mimetype}, Size: ${(req.file.size / 1024 / 1024).toFixed(2)}MB`);
+
+    // Determine file type
+    const fileType = fileProcessor.getFileType(req.file.mimetype, req.file.originalname);
+    
+    if (fileType === "unknown") {
+      return res.status(400).json({
+        error: "Unsupported file type",
+        message: "Supported types: PDF, Word (.doc/.docx), Excel (.xls/.xlsx), Images (JPEG, PNG, GIF, BMP, TIFF)",
+      });
+    }
+
+    // Step 1: Extract text from file
+    const extractStart = Date.now();
+    const extractedText = await fileProcessor.processFile(req.file.path, fileType);
+    const extractTime = Date.now() - extractStart;
+
+    console.log(`📄 Text extracted in ${extractTime}ms, ${(extractedText.length / 1000).toFixed(1)}k characters`);
+
+    if (!extractedText || extractedText.length < 50) {
+      return res.status(400).json({
+        error: "Document appears to be empty or contains insufficient text",
+        message: "Please ensure the document contains readable text content",
+      });
+    }
+
+    // Step 2: Create vector store
+    const contentHash = crypto.createHash("sha256").update(extractedText).digest("hex");
+    const { store, fromCache: storeCached } = await processor.createVectorStore(extractedText, contentHash);
+    const vectorTime = Date.now() - extractStart;
+
+    console.log(`🔍 Vector store ${storeCached ? "loaded from cache" : "created"} in ${vectorTime}ms`);
+
+    // Step 3: Answer questions
+    const answers = await processor.answerQuestions(questions, store, contentHash);
+    const totalTime = Date.now() - startTime;
+
+    // Performance metrics
+    const avgTimePerQuestion = totalTime / questions.length;
+    console.log(`✅ [${requestId}] Completed in ${totalTime}ms (${(totalTime / 1000).toFixed(1)}s)`);
+    console.log(`📊 Average time per question: ${avgTimePerQuestion.toFixed(1)}ms`);
+
+    // Clean up uploaded file
+    try {
+      fs.unlinkSync(req.file.path);
+      console.log(`🗑️ Cleaned up uploaded file: ${req.file.originalname}`);
+    } catch (cleanupError) {
+      console.warn(`⚠️ Failed to clean up file: ${cleanupError.message}`);
+    }
+
+    // Enhanced response with metadata
+    const responseData = {
+      answers: answers,
+      metadata: {
+        file_name: req.file.originalname,
+        file_type: fileType,
+        file_size_mb: (req.file.size / 1024 / 1024).toFixed(2),
+        text_length: extractedText.length,
+        processing_time_ms: totalTime,
+        extraction_time_ms: extractTime,
+        vector_time_ms: vectorTime,
+        questions_processed: questions.length,
+        avg_time_per_question_ms: avgTimePerQuestion.toFixed(1),
+      },
+    };
+
+    // Log the response
+    console.log(`📤 [${req.requestId || requestId}] Response:`, JSON.stringify(responseData, null, 2));
+
+    res.json(responseData);
+
+  } catch (error) {
+    const errorTime = Date.now() - startTime;
+    console.error(`❌ [${requestId}] Error after ${errorTime}ms:`, error.message);
+
+    // Clean up uploaded file on error
+    if (req.file && fs.existsSync(req.file.path)) {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log(`🗑️ Cleaned up file after error: ${req.file.originalname}`);
+      } catch (cleanupError) {
+        console.warn(`⚠️ Failed to clean up file after error: ${cleanupError.message}`);
+      }
+    }
+
+    // Enhanced error response
+    const errorResponse = {
+      error: "File processing failed",
+      message: error.message,
+      processing_time_ms: errorTime,
+      request_id: requestId,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Log the error response
+    console.log(`📤 [${req.requestId || requestId}] Error Response:`, JSON.stringify(errorResponse, null, 2));
+
+    res.status(500).json(errorResponse);
+  }
+});
+
 // Enhanced health check
 app.get("/health", (req, res) => {
   res.json({
@@ -679,6 +1021,8 @@ app.get("/health", (req, res) => {
       vector_stores: vectorStores.size,
       answer_cache: answerCache.size,
       embedding_cache: embeddingCache.size,
+      file_processor_cache: fileProcessor.textCache.size,
+      ocr_cache: fileProcessor.ocrCache.size,
     },
     providers: {
       embedding: "Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)",
@@ -688,12 +1032,31 @@ app.get("/health", (req, res) => {
       },
       architecture: "Alternating Gemini + Groq Processing 🔄",
     },
+    file_processing: {
+      supported_formats: [
+        "PDF files",
+        "Word documents (.doc/.docx)",
+        "Excel spreadsheets (.xls/.xlsx)",
+        "Images with OCR (JPEG, PNG, GIF, BMP, TIFF)"
+      ],
+      ocr_engine: "Tesseract.js with image preprocessing",
+      max_file_size: "50MB",
+      processing_cache: "Enabled for all file types",
+    },
+    endpoints: {
+      "/hackrx/run": "Process PDF from URL",
+      "/hackrx/upload": "Upload and process files (NEW)",
+      "/health": "System health check",
+      "/cache/clear": "Clear all caches",
+    },
     features: [
       "Alternating Gemini 2.5 Flash and Groq processing",
       "Enhanced caching per model",
       "Request-based alternation",
       "Parallel processing",
-      "Model-specific error handling",
+      "Multi-format file support",
+      "OCR for image processing",
+      "Intelligent file type detection",
     ],
   });
 });
@@ -705,6 +1068,7 @@ app.post("/cache/clear", async (req, res) => {
     vectorStores.clear();
     answerCache.clear();
     embeddingCache.clear();
+    fileProcessor.clearCache();
     await redisClient.flushAll();
     // Reset request counter
     requestCounter = 0;
@@ -733,10 +1097,10 @@ const server = app.listen(port, () => {
   console.log(
     `🔧 Embeddings: Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)`
   );
-  console.log(
-    `🌟 Features: Alternating processing, smart caching, parallel execution`
-  );
-  console.log(`⚡ ALTERNATING POWER: Maximum Diversity + Performance!`);
+  console.log(`🌟 Features: Parallel processing, smart fallback, caching`);
+  console.log(`📁 NEW: Multi-format file support (PDF, Word, Excel, Images with OCR)`);
+  console.log(`🔍 OCR: Tesseract.js with image preprocessing for text extraction`);
+  console.log(`🎯 GEMINI POWERED: Maximum Accuracy + Speed!`);
 });
 
 // Enhanced server settings

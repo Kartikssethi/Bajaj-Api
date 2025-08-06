@@ -32,6 +32,7 @@
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "faiss-node": "^0.5.1",
+    "form-data": "^4.0.4",
     "groq-sdk": "^0.29.0",
     "langchain": "^0.3.30",
     "mammoth": "^1.9.1",
