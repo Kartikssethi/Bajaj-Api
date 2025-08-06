@@ -1,7 +1,15 @@
+<<<<<<< Updated upstream
+
+# Ignore Python cache, env files, Redis dump
+kartik/backend/.env
+kartik/backend/__pycache__/
+kartik/backend/dump.rdb
+=======
 .env
 **/.env
 
-venv/
+**/.venv/
 __pycache__/
 *.pyc
 dump.rdb
+>>>>>>> Stashed changes
