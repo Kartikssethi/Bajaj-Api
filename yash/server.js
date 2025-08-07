@@ -17,6 +17,9 @@ const XLSX = require("xlsx");
 const sharp = require("sharp");
 const yauzl = require("yauzl"); // For ZIP file handling
 const { parse: csvParse } = require("csv-parse"); // For CSV parsing
+const xml2js = require("xml2js"); // For PowerPoint parsing
+const officegen = require("officegen"); // For PowerPoint processing
+const fs_extra = require("fs-extra"); // For enhanced file operations
 require("dotenv").config();
 
 const app = express();
@@ -55,6 +58,8 @@ const upload = multer({
       "application/msword", // .doc
       "application/vnd.ms-excel", // .xls
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+      "application/vnd.ms-powerpoint", // .ppt
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation", // .pptx
       "text/csv",
       "application/csv",
       "image/jpeg",
@@ -64,6 +69,13 @@ const upload = multer({
       "image/tiff",
       "application/zip",
       "application/x-zip-compressed",
+      "text/plain", // .txt, .log
+      "text/markdown", // .md
+      "text/html", // .html, .htm
+      "application/xhtml+xml", // .html, .htm
+      "application/json", // .json
+      "application/xml", // .xml
+      "text/xml", // .xml
     ];
 
     // Check by mimetype or by extension (for robust filtering)
@@ -71,7 +83,9 @@ const upload = multer({
       allowedMimeTypes.includes(file.mimetype) ||
       file.originalname
         .toLowerCase()
-        .match(/\.(pdf|doc|docx|xls|xlsx|csv|jpg|jpeg|png|gif|bmp|tiff|zip)$/i)
+        .match(
+          /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|csv|jpg|jpeg|png|gif|bmp|tiff|zip)$/i
+        )
     ) {
       cb(null, true);
     } else {
@@ -334,6 +348,7 @@ class LLMgobrr {
     if (extension === ".bin") return "bin";
     if ([".doc", ".docx"].includes(extension)) return "word";
     if ([".xls", ".xlsx"].includes(extension)) return "excel";
+    if ([".ppt", ".pptx"].includes(extension)) return "powerpoint";
     if (extension === ".csv") return "csv";
     if (extension === ".zip") return "zip";
 
@@ -341,7 +356,7 @@ class LLMgobrr {
   }
 
   async processImageBufferWithGemini(buffer, extension) {
-    const model = genAI.getGenerativeModel({ model: "gemini-pro-vision" }); // Use gemini-pro-vision for images
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); // Use gemini-pro-vision for images
 
     const base64Image = buffer.toString("base64");
     const mimeType = this.getMimeTypeFromExtension(extension);
@@ -374,10 +389,55 @@ class LLMgobrr {
 
   // Groq does not have native image processing. This function explicitly uses Gemini as a fallback/primary for image.
   async processImageBufferWithGroqFallback(buffer, extension) {
-    console.log(
-      "Groq cannot process images directly. Falling back to Gemini Pro Vision for image extraction."
-    );
-    return await this.processImageBufferWithGemini(buffer, extension);
+    try {
+      // Convert buffer to base64
+      const base64Image = buffer.toString("base64");
+      const mimeType = this.getMimeTypeFromExtension(extension);
+      const dataUrl = `data:${mimeType};base64,${base64Image}`;
+
+      const response = await groq.chat.completions.create({
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Extract all text content from this image. Return the extracted text exactly as it appears in the image, maintaining any formatting, structure, and organization. Do not add any introductory or concluding remarks.",
+              },
+              {
+                type: "image_url",
+                image_url: {
+                  url: dataUrl,
+                },
+              },
+            ],
+          },
+        ],
+        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        temperature: 0.05,
+        max_completion_tokens: 400,
+        top_p: 0.85,
+      });
+
+      let extractedText = response.choices[0].message.content;
+      // Clean up potential AI commentary
+      if (extractedText.startsWith("Extracted Text:\n")) {
+        extractedText = extractedText.substring("Extracted Text:\n".length);
+      }
+      if (extractedText.endsWith("\nEnd of Extraction")) {
+        extractedText = extractedText.substring(
+          0,
+          extractedText.length - "\nEnd of Extraction".length
+        );
+      }
+      return extractedText.trim();
+    } catch (error) {
+      console.log(
+        "Groq vision processing failed, falling back to Gemini:",
+        error.message
+      );
+      return await this.processImageBufferWithGemini(buffer, extension);
+    }
   }
 
   getMimeTypeFromExtension(extension) {
@@ -734,12 +794,24 @@ class FileProcessor {
         return this.processWord(filePath, requestId);
       case "excel":
         return this.processExcel(filePath, requestId);
+      case "powerpoint":
+        return this.processPowerPoint(filePath, requestId);
       case "csv":
         return this.processCSV(filePath, requestId);
       case "image":
         return this.processImageWithAI(filePath, requestId);
       case "zip":
         return this.processZip(filePath, requestId);
+      case "text":
+        return this.processTextFile(filePath, requestId);
+      case "markdown":
+        return this.processMarkdown(filePath, requestId);
+      case "html":
+        return this.processHTML(filePath, requestId);
+      case "json":
+        return this.processJSON(filePath, requestId);
+      case "xml":
+        return this.processXML(filePath, requestId);
       default:
         throw new Error(`Unsupported file type: ${fileType}`);
     }
@@ -783,6 +855,386 @@ class FileProcessor {
       allText += `Sheet: ${sheetName}\n${sheetText}\n\n`;
     }
     return allText;
+  }
+
+  async processTextFile(filePath, requestId) {
+    console.log(`[${requestId}] Parsing text file: ${path.basename(filePath)}`);
+    const buffer = fs.readFileSync(filePath);
+
+    // Try to detect the encoding (defaulting to utf8)
+    let encoding = "utf8";
+    if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+      encoding = "utf8"; // BOM detected
+    } else if (buffer[0] === 0xfe && buffer[1] === 0xff) {
+      encoding = "utf16be";
+    } else if (buffer[0] === 0xff && buffer[1] === 0xfe) {
+      encoding = "utf16le";
+    }
+
+    try {
+      const content = fs.readFileSync(filePath, encoding);
+      return content.toString().trim();
+    } catch (error) {
+      // If UTF-8/16 fails, try reading as Latin1
+      const content = fs.readFileSync(filePath, "latin1");
+      return content.toString().trim();
+    }
+  }
+
+  async processMarkdown(filePath, requestId) {
+    console.log(`[${requestId}] Parsing Markdown: ${path.basename(filePath)}`);
+    const content = await this.processTextFile(filePath, requestId);
+    // Remove Markdown formatting for better text extraction
+    return content
+      .replace(/#{1,6}\s/g, "") // Remove headers
+      .replace(/(\*\*|__)(.*?)\1/g, "$2") // Remove bold
+      .replace(/(\*|_)(.*?)\1/g, "$2") // Remove italic
+      .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1") // Convert links to just text
+      .replace(/^\s*[-*+]\s/gm, "") // Remove list markers
+      .replace(/^\s*\d+\.\s/gm, "") // Remove numbered list markers
+      .replace(/`{1,3}[^`]*`{1,3}/g, "") // Remove code blocks
+      .replace(/~~(.*?)~~/g, "$1") // Remove strikethrough
+      .trim();
+  }
+
+  async processHTML(filePath, requestId) {
+    console.log(`[${requestId}] Parsing HTML: ${path.basename(filePath)}`);
+    const content = await this.processTextFile(filePath, requestId);
+
+    // Basic HTML tag removal
+    return content
+      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "") // Remove scripts
+      .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "") // Remove styles
+      .replace(/<[^>]+>/g, " ") // Remove HTML tags
+      .replace(/&[^;]+;/g, " ") // Remove HTML entities
+      .replace(/\s+/g, " ") // Normalize whitespace
+      .trim();
+  }
+
+  async processJSON(filePath, requestId) {
+    console.log(`[${requestId}] Parsing JSON: ${path.basename(filePath)}`);
+    try {
+      const content = await this.processTextFile(filePath, requestId);
+      const parsed = JSON.parse(content);
+
+      // Convert JSON to readable text format
+      const convertToText = (obj, prefix = "") => {
+        let result = [];
+
+        if (Array.isArray(obj)) {
+          obj.forEach((item, index) => {
+            if (typeof item === "object" && item !== null) {
+              result.push(
+                ...convertToText(item, `${prefix}Item ${index + 1}: `)
+              );
+            } else {
+              result.push(`${prefix}${item}`);
+            }
+          });
+        } else {
+          Object.entries(obj).forEach(([key, value]) => {
+            if (typeof value === "object" && value !== null) {
+              result.push(`${prefix}${key}:`);
+              result.push(...convertToText(value, `${prefix}  `));
+            } else {
+              result.push(`${prefix}${key}: ${value}`);
+            }
+          });
+        }
+
+        return result;
+      };
+
+      return convertToText(parsed).join("\n");
+    } catch (error) {
+      console.warn(
+        `[${requestId}] JSON parsing failed, returning raw content: ${error.message}`
+      );
+      return await this.processTextFile(filePath, requestId);
+    }
+  }
+
+  async processXML(filePath, requestId) {
+    console.log(`[${requestId}] Parsing XML: ${path.basename(filePath)}`);
+    try {
+      const content = await this.processTextFile(filePath, requestId);
+      const parser = new xml2js.Parser({
+        explicitArray: false,
+        ignoreAttrs: true,
+        valueProcessors: [(value) => value.trim()],
+      });
+
+      const result = await parser.parseStringPromise(content);
+
+      // Convert XML to readable text format
+      const convertToText = (obj, prefix = "") => {
+        let result = [];
+
+        if (typeof obj === "object" && obj !== null) {
+          Object.entries(obj).forEach(([key, value]) => {
+            if (typeof value === "object" && value !== null) {
+              result.push(`${prefix}${key}:`);
+              result.push(...convertToText(value, `${prefix}  `));
+            } else if (value) {
+              result.push(`${prefix}${key}: ${value}`);
+            }
+          });
+        } else if (obj) {
+          result.push(`${prefix}${obj}`);
+        }
+
+        return result;
+      };
+
+      return convertToText(result).join("\n");
+    } catch (error) {
+      console.warn(
+        `[${requestId}] XML parsing failed, returning raw content: ${error.message}`
+      );
+      return await this.processTextFile(filePath, requestId);
+    }
+  }
+
+  async processPowerPoint(filePath, requestId) {
+    console.log(
+      `[${requestId}] Parsing PowerPoint: ${path.basename(filePath)}`
+    );
+    const buffer = fs.readFileSync(filePath);
+    const extension = path.extname(filePath).toLowerCase();
+
+    // Create temp directory for slide images
+    const tempDir = path.join(
+      __dirname,
+      "temp",
+      "pptx_images_" + crypto.randomBytes(16).toString("hex")
+    );
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    // For PPTX files (XML-based)
+    if (extension === ".pptx") {
+      try {
+        // Process PPTX as a ZIP file to extract slide content
+        const results = await new Promise((resolve, reject) => {
+          const texts = [];
+          const slideImages = [];
+          let pendingSlides = 0;
+          let currentSlideNumber = 0;
+
+          yauzl.fromBuffer(buffer, { lazyEntries: true }, (err, zipfile) => {
+            if (err) reject(err);
+
+            zipfile.on("entry", (entry) => {
+              if (
+                entry.fileName.includes("ppt/slides/slide") &&
+                entry.fileName.endsWith(".xml")
+              ) {
+                pendingSlides++;
+                zipfile.openReadStream(entry, (err, stream) => {
+                  if (err) {
+                    console.warn(
+                      `[${requestId}] Error opening slide stream: ${err.message}`
+                    );
+                    pendingSlides--;
+                    if (pendingSlides === 0) {
+                      resolve({ texts, slideImages });
+                    }
+                    return;
+                  }
+
+                  let content = "";
+                  stream.on("data", (chunk) => (content += chunk));
+                  stream.on("end", async () => {
+                    try {
+                      const parser = new xml2js.Parser();
+                      const result = await parser.parseStringPromise(content);
+
+                      let slideText = "";
+                      if (
+                        result?.["p:sld"]?.["p:cSld"]?.[0]?.["p:spTree"]?.[0]?.[
+                          "p:sp"
+                        ]
+                      ) {
+                        result["p:sld"]["p:cSld"][0]["p:spTree"][0][
+                          "p:sp"
+                        ].forEach((shape) => {
+                          if (shape["p:txBody"]) {
+                            shape["p:txBody"].forEach((textBody) => {
+                              if (textBody["a:p"]) {
+                                textBody["a:p"].forEach((paragraph) => {
+                                  if (paragraph["a:r"]) {
+                                    paragraph["a:r"].forEach((run) => {
+                                      if (run["a:t"]) {
+                                        slideText += run["a:t"].join(" ") + " ";
+                                      }
+                                    });
+                                  }
+                                });
+                              }
+                            });
+                          }
+                        });
+                      }
+
+                      if (slideText.trim()) {
+                        // Get slide number and store text in the correct order
+                        const slideNum = parseInt(
+                          entry.fileName.match(/slide(\d+)\.xml/)?.[1] || "0",
+                          10
+                        );
+                        currentSlideNumber = Math.max(
+                          currentSlideNumber,
+                          slideNum
+                        );
+
+                        // Create slide image using Sharp
+                        const imageFilePath = path.join(
+                          tempDir,
+                          `slide_${slideNum}.png`
+                        );
+
+                        // Create a white background image with text
+                        const svgText = `
+                          <svg width="1920" height="1080">
+                            <rect width="100%" height="100%" fill="white"/>
+                            <text 
+                              x="50%" 
+                              y="50%" 
+                              dominant-baseline="middle" 
+                              text-anchor="middle" 
+                              font-family="Arial" 
+                              font-size="24"
+                              fill="black"
+                            >${slideText.trim()}</text>
+                          </svg>
+                        `;
+
+                        await sharp(Buffer.from(svgText))
+                          .resize(1920, 1080)
+                          .toFile(imageFilePath);
+                        slideImages[slideNum - 1] = imageFilePath;
+
+                        // Store text as backup
+                        texts[
+                          slideNum - 1
+                        ] = `=== Slide ${slideNum} ===\n${slideText.trim()}`;
+                      }
+                    } catch (parseError) {
+                      console.warn(
+                        `[${requestId}] Error parsing slide XML: ${parseError.message}`
+                      );
+                    }
+
+                    pendingSlides--;
+                    if (pendingSlides === 0) {
+                      resolve({ texts, slideImages });
+                    }
+                  });
+
+                  stream.on("error", (streamErr) => {
+                    console.warn(
+                      `[${requestId}] Stream error: ${streamErr.message}`
+                    );
+                    pendingSlides--;
+                    if (pendingSlides === 0) {
+                      resolve({ texts, slideImages });
+                    }
+                  });
+                });
+              }
+              zipfile.readEntry();
+            });
+
+            zipfile.on("end", () => {
+              if (pendingSlides === 0) {
+                resolve({ texts, slideImages });
+              }
+            });
+
+            zipfile.on("error", (error) => {
+              console.error(
+                `[${requestId}] PPTX processing error: ${error.message}`
+              );
+              reject(error);
+            });
+            zipfile.readEntry();
+          });
+        });
+
+        const { texts, slideImages } = results;
+        const combinedResults = [];
+
+        for (let i = 0; i < slideImages.length; i++) {
+          const imagePath = slideImages[i];
+          if (!imagePath) continue;
+
+          try {
+            const extractedText = await this.processImageWithAI(
+              imagePath,
+              requestId
+            );
+            combinedResults.push(
+              `=== Slide ${i + 1} ===\n${extractedText.trim()}`
+            );
+          } catch (error) {
+            console.warn(
+              `[${requestId}] Error processing slide ${i + 1}: ${error.message}`
+            );
+            if (texts[i]) {
+              combinedResults.push(texts[i]);
+            }
+          }
+        }
+
+        // Clean up temp directory
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch (cleanupError) {
+          console.warn(
+            `[${requestId}] Cleanup warning: ${cleanupError.message}`
+          );
+        }
+
+        if (!combinedResults.length) {
+          throw new Error("No content could be extracted from PPTX file");
+        }
+
+        return combinedResults.join("\n\n");
+      } catch (error) {
+        console.error(`[${requestId}] PPTX processing error: ${error.message}`);
+        throw new Error(`Failed to process PPTX file: ${error.message}`);
+      }
+    }
+    // For PPT files (binary format)
+    else if (extension === ".ppt") {
+      try {
+        // Basic text extraction for binary PPT
+        const text = buffer.toString("utf-8");
+        const textContent = text
+          .replace(/[^\x20-\x7E\n\r]/g, " ") // Keep only printable ASCII
+          .replace(/\s+/g, " ") // Normalize whitespace
+          .trim();
+
+        if (!textContent || textContent.length < 50) {
+          throw new Error(
+            "Could not extract meaningful text from binary PPT file. Please convert to PPTX format for better results."
+          );
+        }
+
+        // Split content into potential slides based on common markers
+        const slides = textContent
+          .split(/(?:Slide \d+|={3,})/gi)
+          .filter(Boolean)
+          .map((slide, index) => `=== Slide ${index + 1} ===\n${slide.trim()}`);
+
+        return slides.join("\n\n");
+      } catch (error) {
+        console.error(`[${requestId}] PPT processing error: ${error.message}`);
+        throw new Error(`Failed to process PPT file: ${error.message}`);
+      }
+    }
+    throw new Error(`Unsupported PowerPoint format: ${extension}`);
   }
 
   async processCSV(filePath, requestId) {
@@ -975,6 +1427,8 @@ class FileProcessor {
       return "word";
     if (mimeType?.includes("excel") || filename.match(/\.(xls|xlsx)$/i))
       return "excel";
+    if (mimeType?.includes("powerpoint") || filename.match(/\.(ppt|pptx)$/i))
+      return "powerpoint";
     if (mimeType?.includes("csv") || filename.endsWith(".csv")) return "csv";
     if (
       mimeType?.includes("image") ||
@@ -982,6 +1436,14 @@ class FileProcessor {
     )
       return "image";
     if (mimeType?.includes("zip") || filename.endsWith(".zip")) return "zip";
+    if (mimeType?.includes("text/plain") || filename.match(/\.(txt|log)$/i))
+      return "text";
+    if (mimeType?.includes("markdown") || filename.endsWith(".md"))
+      return "markdown";
+    if (mimeType?.includes("html") || filename.match(/\.(html|htm)$/i))
+      return "html";
+    if (mimeType?.includes("json") || filename.endsWith(".json")) return "json";
+    if (mimeType?.includes("xml") || filename.endsWith(".xml")) return "xml";
 
     return "unknown";
   }
