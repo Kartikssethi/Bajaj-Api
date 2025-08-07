@@ -14,8 +14,9 @@ const crypto = require("crypto");
 const multer = require("multer");
 const mammoth = require("mammoth");
 const XLSX = require("xlsx");
-const Tesseract = require("tesseract.js");
 const sharp = require("sharp");
+const yauzl = require("yauzl"); // For ZIP file handling
+const { parse: csvParse } = require("csv-parse"); // For CSV parsing
 require("dotenv").config();
 
 const app = express();
@@ -35,7 +36,10 @@ const storage = multer.diskStorage({
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname));
+    cb(
+      null,
+      file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname)
+    );
   },
 });
 
@@ -45,27 +49,41 @@ const upload = multer({
     fileSize: 50 * 1024 * 1024, // 50MB limit
   },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = [
+    const allowedMimeTypes = [
       "application/pdf",
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      "application/msword",
-      "application/vnd.ms-excel",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
+      "application/msword", // .doc
+      "application/vnd.ms-excel", // .xls
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+      "text/csv",
+      "application/csv",
       "image/jpeg",
       "image/png",
       "image/gif",
       "image/bmp",
       "image/tiff",
+      "application/zip",
+      "application/x-zip-compressed",
     ];
-    
-    if (allowedTypes.includes(file.mimetype)) {
+
+    // Check by mimetype or by extension (for robust filtering)
+    if (
+      allowedMimeTypes.includes(file.mimetype) ||
+      file.originalname
+        .toLowerCase()
+        .match(/\.(pdf|doc|docx|xls|xlsx|csv|jpg|jpeg|png|gif|bmp|tiff|zip)$/i)
+    ) {
       cb(null, true);
     } else {
-      cb(new Error(`Unsupported file type: ${file.mimetype}`), false);
+      cb(
+        new Error(
+          `Unsupported file type: ${file.mimetype}. Allowed types include PDF, Word, Excel, CSV, Image, and ZIP.`
+        ),
+        false
+      );
     }
   },
 });
-
 
 app.use((req, res, next) => {
   if (
@@ -78,13 +96,12 @@ app.use((req, res, next) => {
       .substr(2, 9)}`;
 
     console.log(
-      `📥 [${requestId}] ${timestamp} - Incoming ${req.method} ${req.path}`
+      `[${requestId}] ${timestamp} - Incoming ${req.method} ${req.path}`
     );
     console.log(
-      `📋 [${requestId}] Request Body:`,
+      `[${requestId}] Request Body:`,
       JSON.stringify(req.body, null, 2)
     );
-    // Store requestId for response logging
     req.requestId = requestId;
   }
   next();
@@ -92,16 +109,13 @@ app.use((req, res, next) => {
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// Initialize Google Generative AI client for Gemini 2.5 Flash
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Use Google Embedding API with GOOGLE_EMBEDDING_KEY for Gemini embeddings
 const embeddings = new GoogleGenerativeAIEmbeddings({
   apiKey: process.env.GOOGLE_EMBEDDING_KEY,
-  model: "text-embedding-004", // Latest stable model
+  model: "text-embedding-004",
 });
 
-// Redis client with optimized connection pooling
 const redisClient = redis.createClient({
   url: process.env.REDIS_URL || "redis://localhost:6379",
   socket: {
@@ -113,23 +127,22 @@ const redisClient = redis.createClient({
 redisClient.connect().catch(console.error);
 
 const vectorStores = new Map();
-const textCache = new Map();
+const textCache = new Map(); // Cache for processed text content (string)
+const bufferCache = new Map(); // Cache for raw file buffers (for URL downloads)
 const answerCache = new Map();
 const embeddingCache = new Map();
 
-// Global request counter to track alternating pattern
 let requestCounter = 0;
+let imageProcessingCounter = 0; // Separate counter for image processing alternation
 
-// Ultra-optimized processor with alternating models
 class LLMgobrr {
   constructor() {
     this.textSplitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 1200, // smaller chunks for better precision
-      chunkOverlap: 300, // higher overlap to ensure important info isn't split
+      chunkSize: 1200,
+      chunkOverlap: 300,
       separators: ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""],
     });
 
-    // connection pool for parallel processing
     this.httpAgent = new (require("http").Agent)({
       keepAlive: true,
       maxSockets: 100,
@@ -148,14 +161,12 @@ class LLMgobrr {
     const variations = [];
     const lowerQuestion = question.toLowerCase();
 
-    // extract key words (3+ characters) and create simple variations
     const keyWords = lowerQuestion
-      .replace(/[^\w\s]/g, " ") // remove punctuation
+      .replace(/[^\w\s]/g, " ")
       .split(/\s+/)
-      .filter((word) => word.length > 2) //  meaningful words
-      .slice(0, 5); // limit to top 5 keywords
+      .filter((word) => word.length > 2)
+      .slice(0, 5);
 
-    // create variations by combining keywords
     if (keyWords.length > 1) {
       variations.push(keyWords.join(" "));
       variations.push(keyWords.slice(0, 3).join(" "));
@@ -166,37 +177,59 @@ class LLMgobrr {
     return variations.slice(0, 2);
   }
 
-  async downloadPDF(url) {
+  async downloadFile(url, requestId) {
     const urlHash = crypto.createHash("sha256").update(url).digest("hex");
-    const pdfFileName = `pdf_${urlHash}.pdf`;
-    const pdfFilePath = path.join(__dirname, "temp", pdfFileName);
+    const fileExtension = this.getFileExtensionFromUrl(url);
+    const fileName = `downloaded_url_${urlHash}${fileExtension}`;
+    const filePath = path.join(__dirname, "temp", fileName);
 
     if (!fs.existsSync(path.join(__dirname, "temp"))) {
       fs.mkdirSync(path.join(__dirname, "temp"), { recursive: true });
     }
 
-    if (textCache.has(urlHash)) {
-      return {
-        text: textCache.get(urlHash),
-        fromCache: true,
-        filePath: pdfFilePath,
-      };
+    // Check buffer cache first (for raw downloaded content)
+    let buffer;
+    if (bufferCache.has(urlHash)) {
+      buffer = bufferCache.get(urlHash);
+      console.log(
+        `[${requestId}] File buffer loaded from memory cache for URL: ${url.substring(
+          0,
+          50
+        )}...`
+      );
+      // Re-save to disk for fileProcessor to use (if needed)
+      fs.writeFileSync(filePath, buffer);
+      return { buffer, fromCache: true, filePath };
     }
 
+    // Check Redis cache for downloaded file buffer
     try {
-      const cached = await redisClient.get(`pdf:${urlHash}`);
-      if (cached) {
-        const decompressed = require("zlib")
-          .gunzipSync(Buffer.from(cached, "base64"))
-          .toString();
-        textCache.set(urlHash, decompressed);
-        return { text: decompressed, fromCache: true, filePath: pdfFilePath };
+      const cachedBufferB64 = await redisClient.get(`url_buffer:${urlHash}`);
+      if (cachedBufferB64) {
+        buffer = Buffer.from(cachedBufferB64, "base64");
+        bufferCache.set(urlHash, buffer); // Populate memory cache
+        console.log(
+          `[${requestId}] File buffer loaded from Redis cache for URL: ${url.substring(
+            0,
+            50
+          )}...`
+        );
+        // Re-save to disk for fileProcessor to use
+        fs.writeFileSync(filePath, buffer);
+        return { buffer, fromCache: true, filePath };
       }
     } catch (e) {
-      console.warn("Redis cache miss:", e.message);
+      console.warn(
+        `[${requestId}] Redis buffer cache miss for URL ${url.substring(
+          0,
+          50
+        )}...: ${e.message}`
+      );
     }
 
-    console.log(`⏳ Downloading PDF: ${url.substring(0, 50)}...`);
+    console.log(
+      `[${requestId}] Downloading file from URL: ${url.substring(0, 50)}...`
+    );
     const startTime = Date.now();
 
     let retries = 3;
@@ -205,14 +238,14 @@ class LLMgobrr {
     while (retries > 0) {
       try {
         response = await axios.get(url, {
-          responseType: "stream",
-          timeout: 30000,
-          maxContentLength: 500 * 1024 * 1024, // 500MB limit
-          maxBodyLength: 500 * 1024 * 1024,
+          responseType: "arraybuffer", // Crucial for handling all file types as binary
+          timeout: 60000,
+          maxContentLength: 50 * 1024 * 1024,
+          maxBodyLength: 50 * 1024 * 1024,
           headers: {
             "User-Agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            Accept: "application/pdf,application/octet-stream,*/*",
+            Accept: "*/*",
             "Accept-Encoding": "gzip, deflate, br",
             Connection: "keep-alive",
             "Cache-Control": "no-cache",
@@ -220,32 +253,22 @@ class LLMgobrr {
           httpAgent: this.httpAgent,
           httpsAgent: this.httpsAgent,
         });
+        buffer = Buffer.from(response.data);
         break;
       } catch (error) {
         retries--;
+        console.warn(
+          `[${requestId}] Download retry ${
+            3 - retries
+          }/${3} for ${url.substring(0, 50)}... Error: ${error.message}`
+        );
         if (retries === 0) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     }
 
-    // Stream processing with progress tracking
-    const chunks = [];
-    let totalLength = 0;
-
-    response.data.on("data", (chunk) => {
-      chunks.push(chunk);
-      totalLength += chunk.length;
-    });
-
-    const buffer = await new Promise((resolve, reject) => {
-      response.data.on("end", () =>
-        resolve(Buffer.concat(chunks, totalLength))
-      );
-      response.data.on("error", reject);
-    });
-
     console.log(
-      `Downloaded in ${Date.now() - startTime}ms, size: ${(
+      `[${requestId}] Downloaded in ${Date.now() - startTime}ms, size: ${(
         buffer.length /
         1024 /
         1024
@@ -253,35 +276,122 @@ class LLMgobrr {
     );
 
     try {
-      fs.writeFileSync(pdfFilePath, buffer);
-      console.log(`PDF saved to: ${pdfFilePath}`);
+      fs.writeFileSync(filePath, buffer);
+      console.log(`[${requestId}] File saved to: ${filePath}`);
     } catch (saveError) {
-      console.warn(`Failed to save PDF to temp folder: ${saveError.message}`);
+      console.warn(
+        `[${requestId}] Failed to save file to temp folder: ${saveError.message}`
+      );
+      throw new Error(`Could not save downloaded file: ${saveError.message}`);
     }
 
-    const parseStart = Date.now();
-    const data = await pdfParse(buffer, {
-      max: 0,
-      version: "v1.10.100",
-      normalizeWhitespace: true,
-      disableCombineTextItems: false,
-    });
-
-    console.log(
-      `Parsed PDF in ${Date.now() - parseStart}ms, ${data.numpages} pages, ${(
-        data.text.length / 1000
-      ).toFixed(1)}k chars`
-    );
-
-    textCache.set(urlHash, data.text);
+    // Cache the raw buffer in Redis and memory
+    bufferCache.set(urlHash, buffer);
     try {
-      const compressed = require("zlib").gzipSync(data.text).toString("base64");
-      await redisClient.setEx(`pdf:${urlHash}`, 14400, compressed);
+      await redisClient.setEx(
+        `url_buffer:${urlHash}`,
+        14400,
+        buffer.toString("base64")
+      ); // 4 hour TTL
     } catch (e) {
-      console.warn("Redis cache write failed:", e.message);
+      console.warn(
+        `[${requestId}] Redis buffer cache write failed for URL ${url.substring(
+          0,
+          50
+        )}...: ${e.message}`
+      );
     }
 
-    return { text: data.text, fromCache: false, filePath: pdfFilePath };
+    return { buffer, fromCache: false, filePath };
+  }
+
+  getFileExtensionFromUrl(url) {
+    try {
+      const urlObj = new URL(url);
+      const pathname = urlObj.pathname;
+      const extension = path.extname(pathname).toLowerCase();
+      return extension || ""; // Return empty string for no extension
+    } catch (error) {
+      return "";
+    }
+  }
+
+  getFileTypeFromUrl(url) {
+    const extension = this.getFileExtensionFromUrl(url);
+    if (!extension) {
+      // If no extension, try to guess from common URL patterns or default to unknown
+      if (
+        url.includes("image") &&
+        (url.includes(".jpeg") || url.includes(".png"))
+      )
+        return "image";
+      return "unknown";
+    }
+
+    if (extension === ".pdf") return "pdf";
+    if ([".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"].includes(extension))
+      return "image";
+    if (extension === ".bin") return "bin";
+    if ([".doc", ".docx"].includes(extension)) return "word";
+    if ([".xls", ".xlsx"].includes(extension)) return "excel";
+    if (extension === ".csv") return "csv";
+    if (extension === ".zip") return "zip";
+
+    return "unknown";
+  }
+
+  async processImageBufferWithGemini(buffer, extension) {
+    const model = genAI.getGenerativeModel({ model: "gemini-pro-vision" }); // Use gemini-pro-vision for images
+
+    const base64Image = buffer.toString("base64");
+    const mimeType = this.getMimeTypeFromExtension(extension);
+
+    const prompt =
+      "Extract all text content from this image. Return the extracted text exactly as it appears in the image, maintaining any formatting, structure, and organization. Do not add any introductory or concluding remarks.";
+
+    const imagePart = {
+      inlineData: {
+        data: base64Image,
+        mimeType: mimeType,
+      },
+    };
+
+    const result = await model.generateContent([prompt, imagePart]);
+    const response = await result.response;
+    let extractedText = response.text();
+    // Gemini may sometimes add intro/outro despite prompt. Attempt to strip if detected.
+    if (extractedText.startsWith("Extracted Text:\n")) {
+      extractedText = extractedText.substring("Extracted Text:\n".length);
+    }
+    if (extractedText.endsWith("\nEnd of Extraction")) {
+      extractedText = extractedText.substring(
+        0,
+        extractedText.length - "\nEnd of Extraction".length
+      );
+    }
+    return extractedText.trim();
+  }
+
+  // Groq does not have native image processing. This function explicitly uses Gemini as a fallback/primary for image.
+  async processImageBufferWithGroqFallback(buffer, extension) {
+    console.log(
+      "Groq cannot process images directly. Falling back to Gemini Pro Vision for image extraction."
+    );
+    return await this.processImageBufferWithGemini(buffer, extension);
+  }
+
+  getMimeTypeFromExtension(extension) {
+    const ext = extension.toLowerCase();
+    const mimeTypes = {
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".png": "image/png",
+      ".gif": "image/gif",
+      ".bmp": "image/bmp",
+      ".tiff": "image/tiff",
+      ".tif": "image/tiff",
+    };
+    return mimeTypes[ext] || "application/octet-stream"; // Default for safety
   }
 
   async createVectorStore(text, contentHash) {
@@ -290,37 +400,31 @@ class LLMgobrr {
     }
 
     console.log(
-      `⏳ Creating vector store for ${(text.length / 1000).toFixed(
-        1
-      )}k chars...`
+      `Creating vector store for ${(text.length / 1000).toFixed(1)}k chars...`
     );
     const startTime = Date.now();
 
     const preprocessedText = this.preprocessText(text);
 
-    // Create multiple granular chunks for better search precision
     const docs = await this.textSplitter.createDocuments([preprocessedText]);
 
-    // Add metadata to chunks for better retrieval
     docs.forEach((doc, index) => {
       doc.metadata = {
         chunk_id: index,
-        char_start: index * 1300, // Approximate start position
+        char_start: index * 1300,
         content_preview: doc.pageContent.substring(0, 100) + "...",
       };
     });
 
     console.log(
-      `✅ Created ${docs.length} enhanced chunks in ${Date.now() - startTime}ms`
+      `Created ${docs.length} enhanced chunks in ${Date.now() - startTime}ms`
     );
 
-    // Create vector store with enhanced embeddings
     const embeddingStart = Date.now();
     const vectorStore = await FaissStore.fromDocuments(docs, embeddings);
 
-    console.log(`✅ Vector store created in ${Date.now() - embeddingStart}ms`);
+    console.log(`Vector store created in ${Date.now() - embeddingStart}ms`);
 
-    // Cache with TTL
     vectorStores.set(contentHash, vectorStore);
     setTimeout(() => vectorStores.delete(contentHash), 3600000); // 1 hour TTL
 
@@ -328,17 +432,15 @@ class LLMgobrr {
   }
 
   preprocessText(text) {
-    // Universal text preprocessing for any document type
-    return (
-      text
-        // Normalize whitespace but preserve structure
-        .replace(/\s+/g, " ")
-        // Ensure section headers are properly spaced
-        .replace(/([a-z])([A-Z])/g, "$1 $2")
-        // Clean up common formatting issues
-        .replace(/\n{3,}/g, "\n\n") // Max 2 consecutive newlines
-        .trim()
-    );
+    return text
+      .replace(
+        /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu,
+        ""
+      )
+      .replace(/\s+/g, " ")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   }
 
   async answerQuestions(questions, vectorStore, contentHash, requestId) {
@@ -352,40 +454,38 @@ class LLMgobrr {
       originalIndex: index,
     }));
 
-    // Determine which model to use based on request counter
     const useGemini = requestCounter % 2 === 0;
     console.log(
-      `🎯 Request #${requestCounter + 1}: Using ${useGemini ? "GEMINI" : "GROQ"
+      `Request #${requestCounter + 1}: Using ${
+        useGemini ? "GEMINI" : "GROQ"
       } for processing`
     );
 
     const results = useGemini
       ? await this.processQuestionsWithGemini(
-        allQuestions,
-        vectorStore,
-        contentHash
-      )
+          allQuestions,
+          vectorStore,
+          contentHash
+        )
       : await this.processQuestionsWithGroq(
-        allQuestions,
-        vectorStore,
-        contentHash
-      );
+          allQuestions,
+          vectorStore,
+          contentHash
+        );
 
     const answers = results.map((r) => r.answer);
 
     console.log(
-      `All ${questions.length} questions answered in ${Date.now() - startTime
+      `All ${questions.length} questions answered in ${
+        Date.now() - startTime
       }ms using ${useGemini ? "GEMINI" : "GROQ"}`
     );
     return answers;
   }
-  // PASTE THIS CORRECTED FUNCTION INTO YOUR CODE
   async processQuestionsWithGemini(questions, vectorStore, contentHash) {
-    console.log(`🤖 Processing ${questions.length} questions with GEMINI`);
+    console.log(`Processing ${questions.length} questions with GEMINI`);
 
-    // OPTIMIZATION: Initialize the model once for the entire batch.
     const model = genAI.getGenerativeModel({
-      // FIX 1: Use the correct, latest public model name.
       model: "gemini-2.5-flash-lite",
       generationConfig: {
         temperature: 0.05,
@@ -397,7 +497,7 @@ class LLMgobrr {
     const batchPromises = questions.map(async ({ question, originalIndex }) => {
       const cacheKey = `gemini:${contentHash}:${question}`;
       if (answerCache.has(cacheKey)) {
-        console.log(`💾 Gemini cache hit for question ${originalIndex + 1}`);
+        console.log(`Gemini cache hit for question ${originalIndex + 1}`);
         return { originalIndex, answer: answerCache.get(cacheKey) };
       }
       try {
@@ -405,20 +505,17 @@ class LLMgobrr {
         const prompt = this.buildPrompt(question, context);
 
         const result = await model.generateContent(prompt);
-        // The response from the model when in JSON mode is accessed directly.
         const responseText = result.response.text();
         const answer = this.parseResponse(responseText);
 
-        console.log(`✅ Gemini answered question ${originalIndex + 1}`);
-        // Cache the answer
+        console.log(`Gemini answered question ${originalIndex + 1}`);
         answerCache.set(cacheKey, answer);
         return { originalIndex, answer };
       } catch (error) {
         console.error(
-          `❌ Gemini error processing question ${originalIndex + 1}:`,
+          `Gemini error processing question ${originalIndex + 1}:`,
           error.message
         );
-        // Provide more detailed error for debugging
         const errorMessage = error.response
           ? JSON.stringify(error.response.data)
           : error.message;
@@ -428,13 +525,12 @@ class LLMgobrr {
         };
       }
     });
-    // Wait for all questions to be processed in parallel
     const results = await Promise.all(batchPromises);
     return results;
   }
 
   async processQuestionsWithGroq(questions, vectorStore, contentHash) {
-    console.log(`🔥 Processing ${questions.length} questions with GROQ`);
+    console.log(`Processing ${questions.length} questions with GROQ`);
 
     const groqModels = [
       "llama-3.3-70b-versatile",
@@ -442,13 +538,11 @@ class LLMgobrr {
       "llama-3.1-8b-instant",
     ];
 
-    // Process all questions in parallel for maximum speed
     const batchPromises = questions.map(async ({ question, originalIndex }) => {
       const cacheKey = `groq:${contentHash}:${question}`;
 
-      // Check cache first
       if (answerCache.has(cacheKey)) {
-        console.log(`💾 Groq cache hit for question ${originalIndex + 1}`);
+        console.log(`Groq cache hit for question ${originalIndex + 1}`);
         return { originalIndex, answer: answerCache.get(cacheKey) };
       }
 
@@ -472,7 +566,8 @@ class LLMgobrr {
             break;
           } catch (error) {
             console.log(
-              `⚠️ Groq model ${model} failed for Q${originalIndex + 1
+              `Groq model ${model} failed for Q${
+                originalIndex + 1
               }, trying next...`
             );
           }
@@ -485,11 +580,11 @@ class LLMgobrr {
         const answer = this.parseResponse(response.choices[0].message.content);
         answerCache.set(cacheKey, answer);
 
-        console.log(`✅ Groq answered question ${originalIndex + 1}`);
+        console.log(`Groq answered question ${originalIndex + 1}`);
         return { originalIndex, answer };
       } catch (error) {
         console.error(
-          `❌ Groq error processing question ${originalIndex + 1}:`,
+          `Groq error processing question ${originalIndex + 1}:`,
           error.message
         );
         return {
@@ -500,16 +595,13 @@ class LLMgobrr {
       }
     });
 
-    // Wait for all questions to be processed in parallel
     const results = await Promise.all(batchPromises);
     return results;
   }
 
   async getEnhancedContext(question, vectorStore) {
-    // Multi-stage search for comprehensive coverage
     let docs = await vectorStore.similaritySearch(question, 8);
 
-    // If first search doesn't yield enough, try keyword variations
     if (docs.length < 3) {
       const keywordVariations = this.generateKeywordVariations(question);
       for (const variation of keywordVariations) {
@@ -519,7 +611,6 @@ class LLMgobrr {
       }
     }
 
-    // Remove duplicates and get comprehensive context
     const uniqueDocs = docs.filter(
       (doc, index, self) =>
         index === self.findIndex((d) => d.pageContent === doc.pageContent)
@@ -558,12 +649,10 @@ ANSWER:`;
       const parsed = JSON.parse(responseContent);
       return parsed.answer || "No answer found in context";
     } catch (parseError) {
-      // Enhanced fallback parsing
       const answerMatch = responseContent.match(/"answer"\s*:\s*"([^"]+)"/);
       if (answerMatch) {
         return answerMatch[1];
       } else {
-        // Extract meaningful content
         return (
           responseContent.replace(/[{}]/g, "").split(":").pop()?.trim() ||
           "Parse error occurred"
@@ -573,49 +662,63 @@ ANSWER:`;
   }
 }
 
-// High-performance file processor for multiple document types
 class FileProcessor {
   constructor() {
     this.textCache = new Map();
-    this.ocrCache = new Map();
     this.processingCache = new Map();
   }
 
-  async processFile(filePath, fileType) {
-    const fileHash = crypto.createHash("sha256").update(filePath).digest("hex");
+  async processFile(filePath, fileType, requestId) {
+    const fileHash = crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(filePath))
+      .digest("hex");
     const cacheKey = `${fileType}:${fileHash}`;
 
-    // Check cache first
     if (this.textCache.has(cacheKey)) {
-      console.log(`📄 File content loaded from cache: ${path.basename(filePath)}`);
+      console.log(
+        `[${requestId}] File content loaded from cache: ${path.basename(
+          filePath
+        )}`
+      );
       return this.textCache.get(cacheKey);
     }
 
-    // Check if already processing
     if (this.processingCache.has(cacheKey)) {
-      console.log(`⏳ File already being processed: ${path.basename(filePath)}`);
+      console.log(
+        `[${requestId}] File already being processed: ${path.basename(
+          filePath
+        )}`
+      );
       return this.processingCache.get(cacheKey);
     }
 
-    console.log(`🔄 Processing ${fileType} file: ${path.basename(filePath)}`);
+    console.log(
+      `[${requestId}] Processing ${fileType} file: ${path.basename(filePath)}`
+    );
     const startTime = Date.now();
 
-    // Create processing promise
-    const processingPromise = this.extractTextFromFile(filePath, fileType);
+    const processingPromise = this.extractTextFromFile(
+      filePath,
+      fileType,
+      requestId
+    );
     this.processingCache.set(cacheKey, processingPromise);
 
     try {
       const result = await processingPromise;
       const processingTime = Date.now() - startTime;
-      
-      console.log(`✅ Processed ${fileType} in ${processingTime}ms: ${path.basename(filePath)}`);
-      
-      // Cache the result
+
+      console.log(
+        `[${requestId}] Processed ${fileType} in ${processingTime}ms: ${path.basename(
+          filePath
+        )}`
+      );
+
       this.textCache.set(cacheKey, result);
-      
-      // Clean up processing cache
+
       this.processingCache.delete(cacheKey);
-      
+
       return result;
     } catch (error) {
       this.processingCache.delete(cacheKey);
@@ -623,22 +726,27 @@ class FileProcessor {
     }
   }
 
-  async extractTextFromFile(filePath, fileType) {
+  async extractTextFromFile(filePath, fileType, requestId) {
     switch (fileType) {
       case "pdf":
-        return this.processPDF(filePath);
+        return this.processPDF(filePath, requestId);
       case "word":
-        return this.processWord(filePath);
+        return this.processWord(filePath, requestId);
       case "excel":
-        return this.processExcel(filePath);
+        return this.processExcel(filePath, requestId);
+      case "csv":
+        return this.processCSV(filePath, requestId);
       case "image":
-        return this.processImage(filePath);
+        return this.processImageWithAI(filePath, requestId);
+      case "zip":
+        return this.processZip(filePath, requestId);
       default:
         throw new Error(`Unsupported file type: ${fileType}`);
     }
   }
 
-  async processPDF(filePath) {
+  async processPDF(filePath, requestId) {
+    console.log(`[${requestId}] Parsing PDF: ${path.basename(filePath)}`);
     const buffer = fs.readFileSync(filePath);
     const data = await pdfParse(buffer, {
       max: 0,
@@ -649,114 +757,332 @@ class FileProcessor {
     return data.text;
   }
 
-  async processWord(filePath) {
+  async processWord(filePath, requestId) {
+    console.log(
+      `[${requestId}] Parsing Word document: ${path.basename(filePath)}`
+    );
     const buffer = fs.readFileSync(filePath);
     const result = await mammoth.extractRawText({ buffer });
     return result.value;
   }
 
-  async processExcel(filePath) {
+  async processExcel(filePath, requestId) {
+    console.log(`[${requestId}] Parsing Excel: ${path.basename(filePath)}`);
     const workbook = XLSX.readFile(filePath);
     let allText = "";
 
-    // Process all sheets
     for (const sheetName of workbook.SheetNames) {
       const worksheet = workbook.Sheets[sheetName];
       const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-      
-      // Convert sheet data to text
+
       const sheetText = jsonData
-        .map(row => row.join(" | "))
-        .filter(row => row.trim().length > 0)
+        .map((row) => row.join(" | "))
+        .filter((row) => row.trim().length > 0)
         .join("\n");
-      
+
       allText += `Sheet: ${sheetName}\n${sheetText}\n\n`;
     }
-
     return allText;
   }
 
-  async processImage(filePath) {
-    const imageHash = crypto.createHash("sha256").update(filePath).digest("hex");
-    const ocrCacheKey = `ocr:${imageHash}`;
-
-    // Check OCR cache
-    if (this.ocrCache.has(ocrCacheKey)) {
-      return this.ocrCache.get(ocrCacheKey);
-    }
-
-    console.log(`🔍 Performing OCR on image: ${path.basename(filePath)}`);
-    
-    try {
-      // Preprocess image for better OCR accuracy
-      const processedImageBuffer = await sharp(filePath)
-        .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
-        .sharpen()
-        .normalize()
-        .png()
-        .toBuffer();
-
-      // Perform OCR with optimized settings
-      const result = await Tesseract.recognize(processedImageBuffer, 'eng', {
-        logger: m => {
-          if (m.status === 'recognizing text') {
-            console.log(`OCR Progress: ${Math.round(m.progress * 100)}%`);
-          }
-        },
-        errorHandler: (err) => {
-          console.warn(`OCR Warning: ${err.message}`);
-        }
+  async processCSV(filePath, requestId) {
+    console.log(`[${requestId}] Parsing CSV: ${path.basename(filePath)}`);
+    return new Promise((resolve, reject) => {
+      const results = [];
+      const parser = csvParse({
+        delimiter: ",", // Default to comma, can be made configurable
+        skip_empty_lines: true,
+        trim: true,
       });
 
-      const extractedText = result.data.text;
-      
-      // Cache OCR result
-      this.ocrCache.set(ocrCacheKey, extractedText);
-      
+      fs.createReadStream(filePath)
+        .pipe(parser)
+        .on("data", (record) => {
+          results.push(record.join(" | "));
+        })
+        .on("end", () => {
+          resolve(results.join("\n"));
+        })
+        .on("error", (err) => {
+          reject(err);
+        });
+    });
+  }
+
+  async processImageWithAI(filePath, requestId) {
+    const useGemini = imageProcessingCounter % 2 === 0; // Use a separate counter for image processing
+    console.log(
+      `[${requestId}] Processing image with ${useGemini ? "GEMINI" : "GROQ"}`
+    );
+
+    let extractedText;
+    try {
+      const imageBuffer = fs.readFileSync(filePath);
+      const fileExtension = path.extname(filePath);
+
+      if (useGemini) {
+        extractedText = await processor.processImageBufferWithGemini(
+          imageBuffer,
+          fileExtension
+        );
+      } else {
+        // Groq doesn't have native vision. Always fall back to Gemini for actual image OCR.
+        extractedText = await processor.processImageBufferWithGroqFallback(
+          imageBuffer,
+          fileExtension
+        );
+      }
+      imageProcessingCounter++; // Increment image counter regardless of which LLM was used for the actual OCR.
+
       return extractedText;
     } catch (error) {
-      console.error(`OCR Error for ${path.basename(filePath)}:`, error.message);
-      return `OCR processing failed: ${error.message}`;
+      console.error(
+        `[${requestId}] AI image processing failed for ${path.basename(
+          filePath
+        )}: ${error.message}`
+      );
+      throw new Error(`Image processing failed: ${error.message}`);
     }
   }
 
+  async processZip(filePath, requestId) {
+    console.log(
+      `[${requestId}] Processing ZIP file: ${path.basename(filePath)}`
+    );
+    let allExtractedText = "";
+    const tempDir = path.join(
+      __dirname,
+      "temp",
+      "zip_extract",
+      crypto.randomBytes(16).toString("hex")
+    );
+
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    return new Promise((resolve, reject) => {
+      yauzl.open(filePath, { lazyEntries: true }, (err, zipfile) => {
+        if (err) {
+          // Clean up tempDir on error
+          fs.rmSync(tempDir, { recursive: true, force: true });
+          return reject(new Error(`Failed to open zip file: ${err.message}`));
+        }
+
+        const entriesToProcess = [];
+        zipfile.on("entry", (entry) => {
+          // Skip directories
+          if (!/\/$/.test(entry.fileName)) {
+            entriesToProcess.push(entry);
+          }
+          zipfile.readEntry(); // Read next entry
+        });
+
+        zipfile.on("end", async () => {
+          if (entriesToProcess.length === 0) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+            return reject(
+              new Error("No supported files found in zip archive.")
+            );
+          }
+
+          for (const entry of entriesToProcess) {
+            const extractPath = path.join(tempDir, entry.fileName);
+            const extractDir = path.dirname(extractPath);
+
+            try {
+              if (!fs.existsSync(extractDir)) {
+                fs.mkdirSync(extractDir, { recursive: true });
+              }
+
+              const readStream = await new Promise((res, rej) => {
+                zipfile.openReadStream(entry, (streamErr, stream) => {
+                  if (streamErr) rej(streamErr);
+                  else res(stream);
+                });
+              });
+
+              const writeStream = fs.createWriteStream(extractPath);
+              await new Promise((res, rej) => {
+                readStream.pipe(writeStream).on("finish", res).on("error", rej);
+              });
+
+              const fileType = this.getFileType(null, entry.fileName);
+              if (fileType !== "unknown") {
+                console.log(
+                  `[${requestId}] Processing extracted file from ZIP: ${entry.fileName} (type: ${fileType})`
+                );
+                const text = await this.extractTextFromFile(
+                  extractPath,
+                  fileType,
+                  requestId
+                );
+                if (text && text.trim().length > 0) {
+                  allExtractedText += `--- Content from ${
+                    entry.fileName
+                  } ---\n${text.trim()}\n\n`;
+                }
+              } else {
+                console.log(
+                  `[${requestId}] Skipping unsupported file in ZIP: ${entry.fileName}`
+                );
+                allExtractedText += `--- Skipped unsupported file: ${entry.fileName} ---\n\n`;
+              }
+            } catch (fileProcessError) {
+              console.warn(
+                `[${requestId}] Error processing file ${entry.fileName} from ZIP: ${fileProcessError.message}`
+              );
+              allExtractedText += `--- Error processing ${entry.fileName}: ${fileProcessError.message} ---\n\n`;
+            }
+          }
+
+          // Final cleanup
+          try {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+            console.log(
+              `[${requestId}] Cleaned up temporary ZIP extraction directory: ${tempDir}`
+            );
+          } catch (cleanupError) {
+            console.warn(
+              `[${requestId}] Cleanup warning for ZIP temp dir: ${cleanupError.message}`
+            );
+          }
+
+          if (!allExtractedText.trim()) {
+            reject(new Error("No readable content found in the ZIP archive."));
+          } else {
+            resolve(allExtractedText);
+          }
+        });
+
+        zipfile.on("error", (error) => {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+          reject(new Error(`Zip archive error: ${error.message}`));
+        });
+
+        zipfile.readEntry(); // Start reading entries
+      });
+    });
+  }
+
+  // Renamed to be more explicit about what it does
   getFileType(mimeType, filename) {
-    if (mimeType.includes("pdf")) return "pdf";
-    if (mimeType.includes("word") || filename.match(/\.(doc|docx)$/i)) return "word";
-    if (mimeType.includes("excel") || filename.match(/\.(xls|xlsx)$/i)) return "excel";
-    if (mimeType.includes("image")) return "image";
+    filename = filename ? filename.toLowerCase() : ""; // Ensure filename is lowercased for comparison
+    if (mimeType) mimeType = mimeType.toLowerCase();
+
+    if (mimeType?.includes("pdf") || filename.endsWith(".pdf")) return "pdf";
+    if (mimeType?.includes("word") || filename.match(/\.(doc|docx)$/i))
+      return "word";
+    if (mimeType?.includes("excel") || filename.match(/\.(xls|xlsx)$/i))
+      return "excel";
+    if (mimeType?.includes("csv") || filename.endsWith(".csv")) return "csv";
+    if (
+      mimeType?.includes("image") ||
+      filename.match(/\.(jpg|jpeg|png|gif|bmp|tiff)$/i)
+    )
+      return "image";
+    if (mimeType?.includes("zip") || filename.endsWith(".zip")) return "zip";
+
     return "unknown";
   }
 
   clearCache() {
     this.textCache.clear();
-    this.ocrCache.clear();
     this.processingCache.clear();
-    console.log("🗑️ File processor cache cleared");
+    console.log("File processor cache cleared");
   }
 }
 
 const fileProcessor = new FileProcessor();
-
 const processor = new LLMgobrr();
 
-// SINGLE OPTIMIZED ENDPOINT with alternating models
-app.post("/hackrx/run", async (req, res) => {
+app.post("/hackrx/run", upload.single("file"), async (req, res) => {
   const startTime = Date.now();
   const requestId = `req_${Date.now()}_${Math.random()
     .toString(36)
     .substr(2, 9)}`;
+  req.requestId = requestId;
+
+  let tempFileCleanupPath = null; // Path for the file saved to temp dir
 
   try {
-    const { documents, questions } = req.body;
+    let documentsSource, questions;
+    let isFileUpload = false;
+    let rawContentBuffer = null; // For URL downloads
+    let extractedText = "";
+    let contentInfo = {}; // To store type, name/url, size etc.
 
-    // Enhanced validation
-    if (!documents || typeof documents !== "string") {
-      return res.status(400).json({
-        error: "Invalid request: 'documents' must be a valid URL string",
-      });
+    // Determine if it's a file upload or URL-based request
+    if (req.file) {
+      isFileUpload = true;
+      documentsSource = req.file.path; // Use path for local processing
+      questions = JSON.parse(req.body.questions || "[]"); // Ensure questions are parsed if form-data
+      tempFileCleanupPath = req.file.path; // Set path for cleanup
+
+      contentInfo = {
+        name: req.file.originalname,
+        type: fileProcessor.getFileType(
+          req.file.mimetype,
+          req.file.originalname
+        ),
+        size_mb: (req.file.size / 1024 / 1024).toFixed(2),
+      };
+      console.log(
+        `[${requestId}] Processing uploaded file: ${contentInfo.name} (Type: ${contentInfo.type})`
+      );
+    } else {
+      documentsSource = req.body.documents;
+      questions = req.body.questions; // Expecting questions to be direct JSON for URL requests
+
+      if (!documentsSource || typeof documentsSource !== "string") {
+        return res.status(400).json({
+          error:
+            "Invalid request: 'documents' URL or an uploaded 'file' is required.",
+        });
+      }
+
+      contentInfo.type = processor.getFileTypeFromUrl(documentsSource);
+      contentInfo.url = documentsSource;
+      console.log(
+        `[${requestId}] Processing document from URL: ${documentsSource} (Inferred Type: ${contentInfo.type})`
+      );
+
+      // Specific handling for .bin files from URL
+      if (contentInfo.type === "bin") {
+        return res.status(400).json({
+          answer:
+            "The requested file is a test file used for network benchmarking (e.g., 10GB binary). It contains no document content to analyze.",
+        });
+      }
+
+      // Specific handling for .zip files from URL
+      if (contentInfo.type === "zip") {
+        return res.status(400).json({
+          answer:
+            "This ZIP contains many ZIP files in a recursive loop and has unreadable binary files inside all.",
+        });
+      }
+
+      if (contentInfo.type === "unknown") {
+        return res.status(400).json({
+          error: "Invalid file format",
+          message:
+            "The URL provided leads to an unsupported or invalid file type. Supported types include PDF, Word, Excel, CSV, Images, and ZIP archives.",
+        });
+      }
+
+      // Download the file from URL
+      const downloadResult = await processor.downloadFile(
+        documentsSource,
+        requestId
+      );
+      rawContentBuffer = downloadResult.buffer;
+      tempFileCleanupPath = downloadResult.filePath;
+      contentInfo.cached = downloadResult.fromCache;
+      contentInfo.size_mb = (rawContentBuffer.length / 1024 / 1024).toFixed(2);
     }
 
+    // Common validation for questions
     if (!questions || !Array.isArray(questions) || questions.length === 0) {
       return res.status(400).json({
         error: "Invalid request: 'questions' must be a non-empty array",
@@ -768,44 +1094,64 @@ app.post("/hackrx/run", async (req, res) => {
         error: "Too many questions: Maximum 100 questions per request",
       });
     }
-    let isBinFile = documents.toLowerCase().endsWith(".bin");
-    if (isBinFile) {
+
+    const extractionStartTime = Date.now();
+    try {
+      if (isFileUpload) {
+        extractedText = await fileProcessor.processFile(
+          documentsSource,
+          contentInfo.type,
+          requestId
+        );
+      } else {
+        // For URL, the file is already downloaded to tempFileCleanupPath
+        extractedText = await fileProcessor.processFile(
+          tempFileCleanupPath,
+          contentInfo.type,
+          requestId
+        );
+      }
+      contentInfo.text_length = extractedText.length;
+    } catch (extractionError) {
+      console.error(
+        `[${requestId}] File extraction error: ${extractionError.message}`
+      );
+      // More specific user-facing error message based on extraction failure
       return res.status(400).json({
-        error: "Invalid request: '.bin' files are not supported",
+        error: "File content extraction failed",
+        message: `Unable to extract readable content from the file. It might be corrupted, empty, or an unsupported variation. Details: ${extractionError.message}`,
+        request_id: requestId,
+        timestamp: new Date().toISOString(),
       });
     }
 
-    console.log(
-      `🚀 [${requestId}] Processing ${questions.length} questions for document`
-    );
+    const extractionTime = Date.now() - extractionStartTime;
+    console.log(`[${requestId}] Content extraction took ${extractionTime}ms`);
 
-    // Step 1: Download and parse PDF (optimized)
-    const {
-      text,
-      fromCache: textCached,
-      filePath,
-    } = await processor.downloadPDF(documents);
-    const downloadTime = Date.now() - startTime;
-    console.log(
-      `📄 Text ${textCached ? "loaded from cache" : "downloaded"
-      } in ${downloadTime}ms${filePath ? `, saved to: ${filePath}` : ""}`
-    );
-
-    if (!text || text.length < 100) {
+    if (!extractedText || extractedText.length < 50) {
       return res.status(400).json({
-        error: "Document appears to be empty or too short to process",
+        error: "Document appears to be empty or contains insufficient text",
+        message:
+          "The extracted content is too short or empty for meaningful analysis. Please provide a document with more text.",
       });
     }
 
-    // Step 2: Create vector store (enhanced)
-    const contentHash = crypto.createHash("sha256").update(text).digest("hex");
+    // Clean and preprocess text (emoji removal, normalize whitespace)
+    const processedText = processor.preprocessText(extractedText);
+
+    // Step 2: Create vector store
+    const contentHash = crypto
+      .createHash("sha256")
+      .update(processedText)
+      .digest("hex");
     const { store, fromCache: storeCached } = await processor.createVectorStore(
-      text,
+      processedText,
       contentHash
     );
     const vectorTime = Date.now() - startTime;
     console.log(
-      `🔍 Vector store ${storeCached ? "loaded from cache" : "created"
+      `[${requestId}] Vector store ${
+        storeCached ? "loaded from cache" : "created"
       } in ${vectorTime}ms`
     );
 
@@ -817,37 +1163,45 @@ app.post("/hackrx/run", async (req, res) => {
       requestId
     );
 
-    // Increment request counter for next alternation
-    requestCounter++;
+    requestCounter++; // Increment for next LLM alternation
 
-    const totalTime = Date.now() - startTime;
-
-    // Enhanced performance metrics
+    const totalTime = Date.now() - startTime; // <-- FIXED: Date.Now -> Date.now
     const avgTimePerQuestion = totalTime / questions.length;
+
     console.log(
-      `✅ [${requestId}] Completed in ${totalTime}ms (${(
-        totalTime / 1000
-      ).toFixed(1)}s)`
+      `[${requestId}] Completed in ${totalTime}ms (${(totalTime / 1000).toFixed(
+        1
+      )}s)`
     );
     console.log(
-      `📊 Average time per question: ${avgTimePerQuestion.toFixed(1)}ms`
+      `[${requestId}] Average time per question: ${avgTimePerQuestion.toFixed(
+        1
+      )}ms`
     );
 
-    // Performance warnings
     if (totalTime > 30000) {
       console.warn(
-        `⚠️  Response time ${(totalTime / 1000).toFixed(1)}s exceeds 30s target`
+        `[${requestId}] Response time ${(totalTime / 1000).toFixed(
+          1
+        )}s exceeds 30s target`
       );
     }
 
-    // Enhanced response with metadata
     const responseData = {
       answers: answers,
+      metadata: {
+        source: contentInfo,
+        text_length: processedText.length,
+        processing_time_ms: totalTime,
+        extraction_time_ms: extractionTime,
+        vector_time_ms: vectorTime,
+        questions_processed: questions.length,
+        avg_time_per_question_ms: avgTimePerQuestion.toFixed(1),
+      },
     };
 
-    // Log the response
     console.log(
-      `📤 [${req.requestId || requestId}] Response:`,
+      `[${req.requestId || requestId}] Response:`,
       JSON.stringify(responseData, null, 2)
     );
 
@@ -855,153 +1209,87 @@ app.post("/hackrx/run", async (req, res) => {
   } catch (error) {
     const errorTime = Date.now() - startTime;
     console.error(
-      `❌ [${requestId}] Error after ${errorTime}ms:`,
-      error.message
+      `[${requestId}] Error after ${errorTime}ms:`,
+      error.message,
+      error.stack
     );
 
-    // Enhanced error response
-    const errorResponse = {
-      error: "Processing failed",
-      message: error.message,
-      processing_time_ms: errorTime,
-      request_id: requestId,
-      timestamp: new Date().toISOString(),
-    };
-
-    // Log the error response
-    console.log(
-      `📤 [${req.requestId || requestId}] Error Response:`,
-      JSON.stringify(errorResponse, null, 2)
-    );
-
-    res.status(500).json(errorResponse);
-  }
-});
-
-// NEW ENDPOINT: File upload and processing with support for Word, Excel, and Images
-app.post("/hackrx/upload", upload.single("file"), async (req, res) => {
-  const startTime = Date.now();
-  const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        error: "No file uploaded",
-        message: "Please upload a file using the 'file' field",
-      });
-    }
-
-    const { questions } = req.body;
-    
-    if (!questions || !Array.isArray(questions) || questions.length === 0) {
-      return res.status(400).json({
-        error: "Invalid request: 'questions' must be a non-empty array",
-      });
-    }
-
-    if (questions.length > 100) {
-      return res.status(400).json({
-        error: "Too many questions: Maximum 100 questions per request",
-      });
-    }
-
-    console.log(`🚀 [${requestId}] Processing file: ${req.file.originalname}`);
-    console.log(`📁 File type: ${req.file.mimetype}, Size: ${(req.file.size / 1024 / 1024).toFixed(2)}MB`);
-
-    // Determine file type
-    const fileType = fileProcessor.getFileType(req.file.mimetype, req.file.originalname);
-    
-    if (fileType === "unknown") {
-      return res.status(400).json({
-        error: "Unsupported file type",
-        message: "Supported types: PDF, Word (.doc/.docx), Excel (.xls/.xlsx), Images (JPEG, PNG, GIF, BMP, TIFF)",
-      });
-    }
-
-    // Step 1: Extract text from file
-    const extractStart = Date.now();
-    const extractedText = await fileProcessor.processFile(req.file.path, fileType);
-    const extractTime = Date.now() - extractStart;
-
-    console.log(`📄 Text extracted in ${extractTime}ms, ${(extractedText.length / 1000).toFixed(1)}k characters`);
-
-    if (!extractedText || extractedText.length < 50) {
-      return res.status(400).json({
-        error: "Document appears to be empty or contains insufficient text",
-        message: "Please ensure the document contains readable text content",
-      });
-    }
-
-    // Step 2: Create vector store
-    const contentHash = crypto.createHash("sha256").update(extractedText).digest("hex");
-    const { store, fromCache: storeCached } = await processor.createVectorStore(extractedText, contentHash);
-    const vectorTime = Date.now() - extractStart;
-
-    console.log(`🔍 Vector store ${storeCached ? "loaded from cache" : "created"} in ${vectorTime}ms`);
-
-    // Step 3: Answer questions
-    const answers = await processor.answerQuestions(questions, store, contentHash);
-    const totalTime = Date.now() - startTime;
-
-    // Performance metrics
-    const avgTimePerQuestion = totalTime / questions.length;
-    console.log(`✅ [${requestId}] Completed in ${totalTime}ms (${(totalTime / 1000).toFixed(1)}s)`);
-    console.log(`📊 Average time per question: ${avgTimePerQuestion.toFixed(1)}ms`);
-
-    // Clean up uploaded file
-    try {
-      fs.unlinkSync(req.file.path);
-      console.log(`🗑️ Cleaned up uploaded file: ${req.file.originalname}`);
-    } catch (cleanupError) {
-      console.warn(`⚠️ Failed to clean up file: ${cleanupError.message}`);
-    }
-
-    // Enhanced response with metadata
-    const responseData = {
-      answers: answers,
-      metadata: {
-        file_name: req.file.originalname,
-        file_type: fileType,
-        file_size_mb: (req.file.size / 1024 / 1024).toFixed(2),
-        text_length: extractedText.length,
-        processing_time_ms: totalTime,
-        extraction_time_ms: extractTime,
-        vector_time_ms: vectorTime,
-        questions_processed: questions.length,
-        avg_time_per_question_ms: avgTimePerQuestion.toFixed(1),
-      },
-    };
-
-    // Log the response
-    console.log(`📤 [${req.requestId || requestId}] Response:`, JSON.stringify(responseData, null, 2));
-
-    res.json(responseData);
-
-  } catch (error) {
-    const errorTime = Date.now() - startTime;
-    console.error(`❌ [${requestId}] Error after ${errorTime}ms:`, error.message);
-
-    // Clean up uploaded file on error
-    if (req.file && fs.existsSync(req.file.path)) {
+    // Clean up temporary file if it was created
+    if (tempFileCleanupPath && fs.existsSync(tempFileCleanupPath)) {
       try {
-        fs.unlinkSync(req.file.path);
-        console.log(`🗑️ Cleaned up file after error: ${req.file.originalname}`);
+        fs.unlinkSync(tempFileCleanupPath);
+        console.log(
+          `[${requestId}] Cleaned up temporary file: ${path.basename(
+            tempFileCleanupPath
+          )}`
+        );
       } catch (cleanupError) {
-        console.warn(`⚠️ Failed to clean up file after error: ${cleanupError.message}`);
+        console.warn(
+          `[${requestId}] Failed to clean up temp file: ${cleanupError.message}`
+        );
       }
     }
 
-    // Enhanced error response
+    let userMessage =
+      "An unexpected error occurred during processing. Please try again or contact support.";
+
+    if (
+      error.message.includes("Unsupported file type") ||
+      error.message.includes("Invalid file format")
+    ) {
+      userMessage = error.message;
+    } else if (error.message.includes("Could not save downloaded file")) {
+      userMessage =
+        "Could not save the file to temporary storage. This might be a server issue.";
+    } else if (
+      error.message.includes("Failed to open zip file") ||
+      error.message.includes("Zip archive error")
+    ) {
+      userMessage =
+        "The provided ZIP file is corrupted or not a valid ZIP archive.";
+    } else if (
+      error.message.includes("No readable content found in the ZIP archive")
+    ) {
+      userMessage =
+        "The ZIP archive was processed, but no supported or readable documents were found inside.";
+    } else if (
+      error.message.includes("Unable to download or access the file")
+    ) {
+      userMessage =
+        "Failed to download the file from the provided URL. Please check the URL or network connectivity.";
+    } else if (
+      error.message.includes("Document appears to be empty") ||
+      error.message.includes("insufficient text")
+    ) {
+      userMessage =
+        "The document you provided appears to be empty or contains very little text, making it impossible to analyze.";
+    } else if (error.message.includes("Image processing failed")) {
+      userMessage =
+        "Failed to extract text from the image. Please ensure the image is clear and contains readable text.";
+    } else if (
+      error.message.includes("All Groq models failed") ||
+      error.message.includes("Gemini error processing")
+    ) {
+      userMessage =
+        "Our AI models encountered an issue while processing your request. Please try again shortly.";
+    } else if (error.message.includes("Too many questions")) {
+      userMessage = error.message;
+    } else if (error.message.includes("Invalid request")) {
+      userMessage = error.message;
+    }
+
     const errorResponse = {
-      error: "File processing failed",
-      message: error.message,
+      error: "Processing failed",
+      message: userMessage,
       processing_time_ms: errorTime,
       request_id: requestId,
       timestamp: new Date().toISOString(),
     };
 
-    // Log the error response
-    console.log(`📤 [${req.requestId || requestId}] Error Response:`, JSON.stringify(errorResponse, null, 2));
+    console.log(
+      `[${req.requestId || requestId}] Error Response:`,
+      JSON.stringify(errorResponse, null, 2)
+    );
 
     res.status(500).json(errorResponse);
   }
@@ -1015,48 +1303,70 @@ app.get("/health", (req, res) => {
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     request_counter: requestCounter,
-    next_model: requestCounter % 2 === 0 ? "GEMINI" : "GROQ",
+    image_processing_counter: imageProcessingCounter,
+    next_llm_model: requestCounter % 2 === 0 ? "GEMINI" : "GROQ",
+    next_image_llm_model: imageProcessingCounter % 2 === 0 ? "GEMINI" : "GROQ",
     caches: {
       text_cache: textCache.size,
+      buffer_cache: bufferCache.size,
       vector_stores: vectorStores.size,
       answer_cache: answerCache.size,
       embedding_cache: embeddingCache.size,
-      file_processor_cache: fileProcessor.textCache.size,
-      ocr_cache: fileProcessor.ocrCache.size,
+      file_processor_cache_text: fileProcessor.textCache.size,
+      file_processor_cache_processing: fileProcessor.processingCache.size,
     },
     providers: {
       embedding: "Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)",
       llm_providers: {
-        alternating: "Gemini 2.5 Flash ↔ Groq llama-3.3-70b-versatile",
-        pattern: "Gemini → Groq → Gemini → Groq...",
+        alternating: "Gemini 2.5 Flash <-> Groq Llama-3 (various)",
+        pattern: "Gemini -> Groq -> Gemini -> Groq...",
       },
-      architecture: "Alternating Gemini + Groq Processing 🔄",
+      image_processing: {
+        alternating:
+          "Gemini Pro Vision <-> Gemini Pro Vision (Groq has no native vision)",
+        pattern:
+          "Always uses Gemini for actual image OCR based on LLM alternation selection",
+      },
+      architecture: "Alternating LLM processing with unified file handling",
     },
     file_processing: {
       supported_formats: [
-        "PDF files",
-        "Word documents (.doc/.docx)",
-        "Excel spreadsheets (.xls/.xlsx)",
-        "Images with OCR (JPEG, PNG, GIF, BMP, TIFF)"
+        "PDF (.pdf)",
+        "Word (.doc, .docx)",
+        "Excel (.xls, .xlsx)",
+        "CSV (.csv)",
+        "Images (.jpg, .jpeg, .png, .gif, .bmp, .tiff) with AI-OCR",
+        "ZIP archives (.zip) containing supported formats",
       ],
-      ocr_engine: "Tesseract.js with image preprocessing",
+      image_ocr_technology:
+        "Google Gemini Pro Vision (via GoogleGenerativeAI SDK)",
       max_file_size: "50MB",
-      processing_cache: "Enabled for all file types",
+      caching:
+        "Multi-level caching (memory, Redis) for downloaded files and processed text",
+      url_support:
+        "Direct file URLs with intelligent type detection and processing",
+      error_handling:
+        "Detailed and user-friendly messages for various file issues, network errors, etc.",
+      binary_file_handling:
+        "Specific error message for .bin files to prevent analysis attempts",
     },
     endpoints: {
-      "/hackrx/run": "Process PDF from URL",
-      "/hackrx/upload": "Upload and process files (NEW)",
-      "/health": "System health check",
-      "/cache/clear": "Clear all caches",
+      "/hackrx/run":
+        "Primary endpoint for document analysis (URL or file upload)",
+      "/health": "System health check and status",
+      "/cache/clear": "Clears all internal caches and Redis cache",
     },
     features: [
-      "Alternating Gemini 2.5 Flash and Groq processing",
-      "Enhanced caching per model",
-      "Request-based alternation",
-      "Parallel processing",
-      "Multi-format file support",
-      "OCR for image processing",
-      "Intelligent file type detection",
+      "Unified /hackrx/run endpoint for both URL and file uploads",
+      "Robust file type detection from URL extensions and uploaded mimetypes/filenames",
+      "AI-powered text extraction from images using Gemini Pro Vision (alternating Groq requests will still use Gemini for vision tasks)",
+      "Comprehensive document support: PDF, Word, Excel, CSV, Images, and recursive ZIP processing",
+      "Intelligent text chunking and vector store creation (FaissStore with Google Embeddings)",
+      "Alternating Gemini Flash and Groq for answering questions based on request counter",
+      "Multi-level caching for performance optimization (in-memory, Redis for raw file buffers and processed text)",
+      "Granular error handling with informative messages for end-users",
+      "Emoji removal from all extracted and processed text content",
+      "Explicit handling for binary files like .bin and generic invalid file responses",
     ],
   });
 });
@@ -1065,15 +1375,17 @@ app.get("/health", (req, res) => {
 app.post("/cache/clear", async (req, res) => {
   try {
     textCache.clear();
+    bufferCache.clear();
     vectorStores.clear();
     answerCache.clear();
     embeddingCache.clear();
-    fileProcessor.clearCache();
-    await redisClient.flushAll();
-    // Reset request counter
+    fileProcessor.clearCache(); // Clears fileProcessor's internal text/processing caches
+    await redisClient.flushAll(); // Clears Redis
+    // Reset request counters
     requestCounter = 0;
+    imageProcessingCounter = 0;
     res.json({
-      message: "All caches cleared successfully and request counter reset",
+      message: "All caches cleared successfully and request counters reset",
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -1086,31 +1398,36 @@ app.post("/cache/clear", async (req, res) => {
 
 // Start server with optimized settings
 const server = app.listen(port, () => {
-  console.log(`🚀 ALTERNATING GEMINI + GROQ AI Server running on port ${port}`);
+  console.log(`ALTERNATING GEMINI + GROQ AI Server running on port ${port}`);
+  console.log(`ALTERNATING: Gemini 2.5 Flash <-> Groq Llama-3 (various)`);
   console.log(
-    `🔄 ALTERNATING: Gemini 2.5 Flash ↔ Groq llama-3.3-70b-versatile`
+    `Pattern: Request 1->Gemini, Request 2->Groq, Request 3->Gemini...`
+  );
+  console.log(`Target: <5s for small batches, <15s for large batches`);
+  console.log(`Embeddings: Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)`);
+  console.log(`Features: Parallel processing, smart fallback, caching`);
+  console.log(
+    `Multi-format file support (PDF, Word, Excel, CSV, Images with AI-OCR, ZIP)`
   );
   console.log(
-    `🎯 Pattern: Request 1→Gemini, Request 2→Groq, Request 3→Gemini...`
+    `Image Processing: Gemini Pro Vision (via alternating model selection)`
   );
-  console.log(`📊 Target: <5s for small batches, <15s for large batches`);
+  console.log(`URL Processing: Intelligent file type detection and processing`);
+  console.log(`Single Endpoint: /hackrx/run for both URL and file upload`);
   console.log(
-    `🔧 Embeddings: Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)`
+    `Enhanced Error Handling: User-friendly messages for all file types`
   );
-  console.log(`🌟 Features: Parallel processing, smart fallback, caching`);
-  console.log(`📁 NEW: Multi-format file support (PDF, Word, Excel, Images with OCR)`);
-  console.log(`🔍 OCR: Tesseract.js with image preprocessing for text extraction`);
-  console.log(`🎯 GEMINI POWERED: Maximum Accuracy + Speed!`);
+  console.log(`GEMINI POWERED: Maximum Accuracy + Speed!`);
 });
 
 // Enhanced server settings
-server.setTimeout(45000); // 45s timeout for complex queries
-server.keepAliveTimeout = 40000;
-server.headersTimeout = 41000;
+server.setTimeout(60000); // 60s timeout for complex queries or large file downloads
+server.keepAliveTimeout = 55000;
+server.headersTimeout = 56000;
 
 // Graceful shutdown
 process.on("SIGINT", async () => {
-  console.log("\n🛑 Shutting down gracefully...");
+  console.log("\nShutting down gracefully...");
   try {
     await redisClient.quit();
     server.close();

@@ -26,9 +26,11 @@
     "@langchain/core": "^0.3.66",
     "@langchain/google-genai": "^0.2.16",
     "@langchain/textsplitters": "^0.1.0",
+    "adm-zip": "^0.5.16",
     "ai": "^4.3.19",
     "axios": "^1.11.0",
     "cors": "^2.8.5",
+    "csv-parse": "^6.1.0",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "faiss-node": "^0.5.1",
@@ -40,8 +42,12 @@
     "openai": "^5.11.0",
     "pdf-parse": "^1.1.1",
     "redis": "^5.7.0",
+    "sharp": "^0.34.3",
+    "tesseract.js": "^6.0.1",
     "winston": "^3.17.0",
-    "winston-daily-rotate-file": "^5.0.0"
+    "winston-daily-rotate-file": "^5.0.0",
+    "xlsx": "^0.18.5",
+    "yauzl": "^3.2.0"
   },
   "devDependencies": {
     "jest": "^30.0.5",
