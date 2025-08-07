@@ -1648,16 +1648,7 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
     }
 
     const responseData = {
-      answers: answers,
-      metadata: {
-        source: contentInfo,
-        text_length: processedText.length,
-        processing_time_ms: totalTime,
-        extraction_time_ms: extractionTime,
-        vector_time_ms: vectorTime,
-        questions_processed: questions.length,
-        avg_time_per_question_ms: avgTimePerQuestion.toFixed(1),
-      },
+      answers: answers
     };
 
     console.log(
