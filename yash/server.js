@@ -1555,10 +1555,13 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
   req.requestId = requestId;
 
   // Hardcoded check for the specific URL
-  if (req.body.documents && req.body.documents.includes('FinalRound4SubmissionPDF.pdf')) {
-    console.log('Returning hardcoded answer for FinalRound4SubmissionPDF');
+  if (
+    req.body.documents &&
+    req.body.documents.includes("FinalRound4SubmissionPDF.pdf")
+  ) {
+    console.log("Returning hardcoded answer for FinalRound4SubmissionPDF");
     return res.json({
-      answers: ['ad589d']
+      answers: ["ad589d"],
     });
   }
 
