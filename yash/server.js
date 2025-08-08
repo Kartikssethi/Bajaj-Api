@@ -21,6 +21,8 @@ const xml2js = require("xml2js"); // For PowerPoint parsing
 const officegen = require("officegen"); // For PowerPoint processing
 const fs_extra = require("fs-extra"); // For enhanced file operations
 require("dotenv").config();
+const cheerio = require("cheerio");
+const puppeteer = require("puppeteer");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -192,6 +194,12 @@ class LLMgobrr {
   }
 
   async downloadFile(url, requestId) {
+    // Updated webpage detection
+    if (this.getFileTypeFromUrl(url) === "webpage") {
+      console.log(`[${requestId}] Detected webpage, initiating scraping`);
+      return await this.scrapeWebpage(url, requestId);
+    }
+
     const urlHash = crypto.createHash("sha256").update(url).digest("hex");
     const fileExtension = this.getFileExtensionFromUrl(url);
     const fileName = `downloaded_url_${urlHash}${fileExtension}`;
@@ -317,6 +325,63 @@ class LLMgobrr {
     return { buffer, fromCache: false, filePath };
   }
 
+  async scrapeWebpage(url, requestId) {
+    console.log(`[${requestId}] Scraping webpage: ${url}`);
+
+    try {
+      // Launch Puppeteer first for dynamic content
+      const browser = await puppeteer.launch({
+        headless: "new",
+        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      });
+
+      const page = await browser.newPage();
+
+      // Set default navigation timeout
+      page.setDefaultNavigationTimeout(30000);
+
+      // Enable request interception to handle potential redirects
+      await page.setRequestInterception(true);
+      page.on("request", (request) => {
+        if (["image", "stylesheet", "font"].includes(request.resourceType())) {
+          request.abort();
+        } else {
+          request.continue();
+        }
+      });
+
+      await page.goto(url, {
+        waitUntil: ["networkidle0", "domcontentloaded"],
+        timeout: 30000,
+      });
+
+      // Wait for specific selectors if needed (especially for hackrx.in)
+      if (url.includes("hackrx.in")) {
+        await page.waitForSelector("body", { timeout: 5000 });
+      }
+
+      const content = await page.evaluate(() => document.body.innerText);
+      await browser.close();
+
+      // Convert scraped content to a buffer
+      const buffer = Buffer.from(content);
+
+      // Save to temp file for processing
+      const tempPath = path.join(
+        __dirname,
+        "temp",
+        `scraped_${Date.now()}.txt`
+      );
+      fs.writeFileSync(tempPath, buffer);
+
+      console.log(`[${requestId}] Successfully scraped webpage content`);
+      return { buffer, fromCache: false, filePath: tempPath };
+    } catch (error) {
+      console.error(`[${requestId}] Scraping error:`, error.message);
+      throw new Error(`Failed to scrape webpage: ${error.message}`);
+    }
+  }
+
   getFileExtensionFromUrl(url) {
     try {
       const urlObj = new URL(url);
@@ -329,15 +394,18 @@ class LLMgobrr {
   }
 
   getFileTypeFromUrl(url) {
+    // First check if it's a webpage that needs scraping
+    if (!url.includes(".")) {
+      return "webpage";
+    }
+
+    if (url.includes("hackrx.in") || url.includes("register.hackrx.in")) {
+      return "webpage";
+    }
+
     const extension = this.getFileExtensionFromUrl(url);
     if (!extension) {
-      // If no extension, try to guess from common URL patterns or default to unknown
-      if (
-        url.includes("image") &&
-        (url.includes(".jpeg") || url.includes(".png"))
-      )
-        return "image";
-      return "unknown";
+      return "webpage"; // Treat URLs without extensions as webpages
     }
 
     if (extension === ".pdf") return "pdf";
@@ -786,6 +854,8 @@ class FileProcessor {
 
   async extractTextFromFile(filePath, fileType, requestId) {
     switch (fileType) {
+      case "webpage":
+        return this.processWebpage(filePath, requestId);
       case "pdf":
         return this.processPDF(filePath, requestId);
       case "word":
@@ -812,6 +882,20 @@ class FileProcessor {
         return this.processXML(filePath, requestId);
       default:
         throw new Error(`Unsupported file type: ${fileType}`);
+    }
+  }
+
+  async processWebpage(filePath, requestId) {
+    console.log(
+      `[${requestId}] Processing webpage content: ${path.basename(filePath)}`
+    );
+    try {
+      return await this.processTextFile(filePath, requestId);
+    } catch (error) {
+      console.error(
+        `[${requestId}] Webpage processing error: ${error.message}`
+      );
+      throw error;
     }
   }
 
@@ -1417,8 +1501,13 @@ class FileProcessor {
 
   // Renamed to be more explicit about what it does
   getFileType(mimeType, filename) {
-    filename = filename ? filename.toLowerCase() : ""; // Ensure filename is lowercased for comparison
+    filename = filename ? filename.toLowerCase() : "";
     if (mimeType) mimeType = mimeType.toLowerCase();
+
+    // Add webpage type detection
+    if (filename.startsWith("scraped_")) {
+      return "webpage";
+    }
 
     if (mimeType?.includes("pdf") || filename.endsWith(".pdf")) return "pdf";
     if (mimeType?.includes("word") || filename.match(/\.(doc|docx)$/i))
@@ -1442,6 +1531,9 @@ class FileProcessor {
       return "html";
     if (mimeType?.includes("json") || filename.endsWith(".json")) return "json";
     if (mimeType?.includes("xml") || filename.endsWith(".xml")) return "xml";
+    if (!mimeType && !filename) {
+      return "webpage";
+    }
 
     return "unknown";
   }
@@ -1648,7 +1740,7 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
     }
 
     const responseData = {
-      answers: answers
+      answers: answers,
     };
 
     console.log(
