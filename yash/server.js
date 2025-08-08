@@ -22,7 +22,6 @@ const officegen = require("officegen"); // For PowerPoint processing
 const fs_extra = require("fs-extra"); // For enhanced file operations
 require("dotenv").config();
 const cheerio = require("cheerio");
-const puppeteer = require("puppeteer");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -329,49 +328,36 @@ class LLMgobrr {
     console.log(`[${requestId}] Scraping webpage: ${url}`);
 
     try {
-      // Launch Puppeteer first for dynamic content
-      const browser = await puppeteer.launch({
-        headless: "new",
-        args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      const response = await axios.get(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+          'Cache-Control': 'max-age=0'
+        },
+        timeout: 30000
       });
 
-      const page = await browser.newPage();
-
-      // Set default navigation timeout
-      page.setDefaultNavigationTimeout(30000);
-
-      // Enable request interception to handle potential redirects
-      await page.setRequestInterception(true);
-      page.on("request", (request) => {
-        if (["image", "stylesheet", "font"].includes(request.resourceType())) {
-          request.abort();
-        } else {
-          request.continue();
-        }
-      });
-
-      await page.goto(url, {
-        waitUntil: ["networkidle0", "domcontentloaded"],
-        timeout: 30000,
-      });
-
-      // Wait for specific selectors if needed (especially for hackrx.in)
-      if (url.includes("hackrx.in")) {
-        await page.waitForSelector("body", { timeout: 5000 });
-      }
-
-      const content = await page.evaluate(() => document.body.innerText);
-      await browser.close();
+      const $ = cheerio.load(response.data);
+      
+      // Remove unwanted elements
+      $('script').remove();
+      $('style').remove();
+      $('noscript').remove();
+      $('iframe').remove();
+      
+      // Get text content
+      let content = $('body').text()
+        .replace(/\s+/g, ' ')
+        .trim();
 
       // Convert scraped content to a buffer
       const buffer = Buffer.from(content);
 
       // Save to temp file for processing
-      const tempPath = path.join(
-        __dirname,
-        "temp",
-        `scraped_${Date.now()}.txt`
-      );
+      const tempPath = path.join(__dirname, "temp", `scraped_${Date.now()}.txt`);
       fs.writeFileSync(tempPath, buffer);
 
       console.log(`[${requestId}] Successfully scraped webpage content`);
