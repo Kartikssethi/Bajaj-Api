@@ -586,13 +586,8 @@ class LLMgobrr {
       } for processing`
     );
 
-    const results = useGemini
-      ? await this.processQuestionsWithGemini(
-          allQuestions,
-          vectorStore,
-          contentHash
-        )
-      : await this.processQuestionsWithGroq(
+    const results =
+      await this.processQuestionsWithGroq(
           allQuestions,
           vectorStore,
           contentHash
@@ -658,7 +653,7 @@ class LLMgobrr {
     console.log(`Processing ${questions.length} questions with GROQ`);
 
     const groqModels = [
-      "llama-3.3-70b-versatile",
+      "openai/gpt-oss-20b",
       "llama-3.1-70b-versatile",
       "llama-3.1-8b-instant",
     ];
