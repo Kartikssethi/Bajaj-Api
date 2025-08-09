@@ -17,8 +17,8 @@ const XLSX = require("xlsx");
 const sharp = require("sharp");
 const yauzl = require("yauzl"); // For ZIP file handling
 const { parse: csvParse } = require("csv-parse"); // For CSV parsing
-const xml2js = require("xml2js"); // For PowerPoint parsing
-const officegen = require("officegen"); // For PowerPoint processing
+// const xml2js = require("xml2js"); // For PowerPoint parsing - temporarily disabled
+// const officegen = require("officegen"); // For PowerPoint processing - temporarily disabled
 const fs_extra = require("fs-extra"); // For enhanced file operations
 require("dotenv").config();
 const cheerio = require("cheerio");
@@ -122,14 +122,44 @@ app.use((req, res, next) => {
   next();
 });
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// Initialize clients only if environment variables are available
+let groq, genAI, embeddings;
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+try {
+  if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== 'test') {
+    groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    console.log('Groq client initialized successfully');
+  } else {
+    console.log('Groq API key not provided - Groq functionality will be disabled');
+  }
+} catch (error) {
+  console.log('Failed to initialize Groq client:', error.message);
+}
 
-const embeddings = new GoogleGenerativeAIEmbeddings({
-  apiKey: process.env.GOOGLE_EMBEDDING_KEY,
-  model: "text-embedding-004",
-});
+try {
+  if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'test') {
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    console.log('Gemini client initialized successfully');
+  } else {
+    console.log('Gemini API key not provided - Gemini functionality will be disabled');
+  }
+} catch (error) {
+  console.log('Failed to initialize Gemini client:', error.message);
+}
+
+try {
+  if (process.env.GOOGLE_EMBEDDING_KEY && process.env.GOOGLE_EMBEDDING_KEY !== 'test') {
+    embeddings = new GoogleGenerativeAIEmbeddings({
+      apiKey: process.env.GOOGLE_EMBEDDING_KEY,
+      model: "text-embedding-004",
+    });
+    console.log('Google Embeddings client initialized successfully');
+  } else {
+    console.log('Google Embeddings API key not provided - Embeddings functionality will be disabled');
+  }
+} catch (error) {
+  console.log('Failed to initialize Google Embeddings client:', error.message);
+}
 
 const redisClient = redis.createClient({
   url: process.env.REDIS_URL || "redis://localhost:6379",
@@ -557,6 +587,107 @@ class LLMgobrr {
       .replace(/([a-z])([A-Z])/g, "$1 $2")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+  }
+
+  async answerQuestionsDirectly(questions, pdfBuffer, requestId) {
+    console.log(
+      `[${requestId}] Bypassing RAG - sending PDF directly to Gemini for ${questions.length} questions`
+    );
+    const startTime = Date.now();
+
+    // Check PDF size - Gemini has limits for PDF processing
+    const pdfSizeMB = pdfBuffer.length / (1024 * 1024);
+    if (pdfSizeMB > 20) {
+      console.warn(`[${requestId}] PDF size ${pdfSizeMB.toFixed(2)}MB exceeds Gemini's recommended limit of 20MB`);
+    }
+
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash-lite",
+      generationConfig: {
+        temperature: 0.05,
+        topP: 0.85,
+        response_mime_type: "application/json",
+      },
+    });
+
+    const batchPromises = questions.map(async (question, index) => {
+      const cacheKey = `direct_gemini:${crypto.createHash("sha256").update(pdfBuffer).digest("hex")}:${question}`;
+      if (answerCache.has(cacheKey)) {
+        console.log(`[${requestId}] Direct Gemini cache hit for question ${index + 1}`);
+        return { originalIndex: index, answer: answerCache.get(cacheKey) };
+      }
+
+      try {
+        // Convert PDF buffer to base64
+        const base64PDF = pdfBuffer.toString("base64");
+        
+        const prompt = `You are an expert document analyst. Analyze the provided PDF document and answer the following question based on the content.
+
+QUESTION: ${question}
+
+CRITICAL INSTRUCTIONS:
+1. Extract the EXACT information from the PDF document - do not say "context doesn't contain enough information" unless truly absent
+2. Look for specific numbers, dates, percentages, conditions, and definitions
+3. If you find partial information, provide what's available with specific details
+4. Include specific terms, timeframes, and conditions mentioned in the document
+5. For definitions, provide the complete definition as stated
+6. Be comprehensive but concise - include all relevant details from the document
+7. Write answers in clear, human-readable format with proper punctuation and grammar
+8. Focus on factual information directly from the document
+
+FORMAT: Respond with JSON: {"answer": "detailed answer with specific information from document"}
+
+ANSWER:`;
+
+        const pdfPart = {
+          inlineData: {
+            data: base64PDF,
+            mimeType: "application/pdf",
+          },
+        };
+
+        const result = await model.generateContent([prompt, pdfPart]);
+        const responseText = result.response.text();
+        const answer = this.parseResponse(responseText);
+
+        console.log(`[${requestId}] Direct Gemini answered question ${index + 1}`);
+        answerCache.set(cacheKey, answer);
+        return { originalIndex: index, answer };
+      } catch (error) {
+        console.error(
+          `[${requestId}] Direct Gemini error processing question ${index + 1}:`,
+          error.message
+        );
+        
+        // Check for specific Gemini errors
+        if (error.message.includes("file size") || error.message.includes("too large")) {
+          return {
+            originalIndex: index,
+            answer: "Sorry, the PDF file is too large for direct processing. Please try with a smaller PDF file.",
+          };
+        } else if (error.message.includes("invalid") || error.message.includes("corrupted")) {
+          return {
+            originalIndex: index,
+            answer: "Sorry, the PDF file appears to be corrupted or invalid. Please try with a different PDF file.",
+          };
+        } else {
+          return {
+            originalIndex: index,
+            answer: `Sorry, I encountered an error processing this question with Gemini. Details: ${error.message}`,
+          };
+        }
+      }
+    });
+
+    const results = await Promise.all(batchPromises);
+    const answers = results.sort((a, b) => a.originalIndex - b.originalIndex).map(r => r.answer);
+
+    console.log(
+      `[${requestId}] All ${questions.length} questions answered directly with Gemini in ${
+        Date.now() - startTime
+      }ms`
+    );
+    return answers;
   }
 
   async answerQuestions(questions, vectorStore, contentHash, requestId) {
@@ -1034,6 +1165,11 @@ class FileProcessor {
     console.log(`[${requestId}] Parsing XML: ${path.basename(filePath)}`);
     try {
       const content = await this.processTextFile(filePath, requestId);
+      // XML parsing temporarily disabled due to missing xml2js dependency
+      console.warn(`[${requestId}] XML parsing disabled - returning raw content`);
+      return content;
+      
+      /* Temporarily disabled xml2js processing
       const parser = new xml2js.Parser({
         explicitArray: false,
         ignoreAttrs: true,
@@ -1063,6 +1199,7 @@ class FileProcessor {
       };
 
       return convertToText(result).join("\n");
+      */
     } catch (error) {
       console.warn(
         `[${requestId}] XML parsing failed, returning raw content: ${error.message}`
@@ -1123,6 +1260,10 @@ class FileProcessor {
                   stream.on("data", (chunk) => (content += chunk));
                   stream.on("end", async () => {
                     try {
+                      // XML parsing temporarily disabled due to missing xml2js dependency
+                      console.warn(`[${requestId}] PowerPoint XML parsing disabled - skipping slide content extraction`);
+                      
+                      /* Temporarily disabled xml2js processing
                       const parser = new xml2js.Parser();
                       const result = await parser.parseStringPromise(content);
 
@@ -1196,6 +1337,7 @@ class FileProcessor {
                           slideNum - 1
                         ] = `=== Slide ${slideNum} ===\n${slideText.trim()}`;
                       }
+                      */
                     } catch (parseError) {
                       console.warn(
                         `[${requestId}] Error parsing slide XML: ${parseError.message}`
@@ -1691,6 +1833,111 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
         message:
           "The extracted content is too short or empty for meaningful analysis. Please provide a document with more text.",
       });
+    }
+
+    // Bypass RAG for PDFs - send directly to Gemini
+    if (contentInfo.type === "pdf") {
+      console.log(`[${requestId}] PDF detected - bypassing RAG and sending directly to Gemini`);
+      
+      let pdfBuffer;
+      try {
+        if (isFileUpload) {
+          // For file uploads, read the file buffer
+          pdfBuffer = fs.readFileSync(documentsSource);
+        } else {
+          // For URLs, use the downloaded buffer
+          pdfBuffer = rawContentBuffer;
+        }
+
+        const answers = await processor.answerQuestionsDirectly(
+          questions,
+          pdfBuffer,
+          requestId
+        );
+
+        const totalTime = Date.now() - startTime;
+        const avgTimePerQuestion = totalTime / questions.length;
+
+        console.log(
+          `[${requestId}] PDF direct processing completed in ${totalTime}ms (${(totalTime / 1000).toFixed(
+            1
+          )}s)`
+        );
+        console.log(
+          `[${requestId}] Average time per question: ${avgTimePerQuestion.toFixed(
+            1
+          )}ms`
+        );
+
+        const responseData = {
+          answers: answers,
+        };
+
+        console.log(
+          `[${req.requestId || requestId}] Response:`,
+          JSON.stringify(responseData, null, 2)
+        );
+
+        return res.json(responseData);
+      } catch (pdfError) {
+        console.error(`[${requestId}] PDF direct processing failed: ${pdfError.message}`);
+        // Fall back to RAG processing if direct PDF processing fails
+        console.log(`[${requestId}] Falling back to RAG processing for PDF`);
+        
+        // Continue with the existing RAG pipeline
+        const processedText = processor.preprocessText(extractedText);
+        
+        // Step 2: Create vector store
+        const contentHash = crypto
+          .createHash("sha256")
+          .update(processedText)
+          .digest("hex");
+        const { store, fromCache: storeCached } = await processor.createVectorStore(
+          processedText,
+          contentHash
+        );
+        const vectorTime = Date.now() - startTime;
+        console.log(
+          `[${requestId}] Vector store ${
+            storeCached ? "loaded from cache" : "created"
+          } in ${vectorTime}ms`
+        );
+
+        // Step 3: Answer questions with alternating models
+        const answers = await processor.answerQuestions(
+          questions,
+          store,
+          contentHash,
+          requestId
+        );
+
+        requestCounter++; // Increment for next LLM alternation
+
+        const totalTime = Date.now() - startTime;
+        const avgTimePerQuestion = totalTime / questions.length;
+
+        console.log(
+          `[${requestId}] PDF RAG fallback completed in ${totalTime}ms (${(totalTime / 1000).toFixed(
+            1
+          )}s)`
+        );
+        console.log(
+          `[${requestId}] Average time per question: ${avgTimePerQuestion.toFixed(
+            1
+          )}ms`
+        );
+
+        const responseData = {
+          answers: answers,
+        };
+
+        console.log(
+          `[${req.requestId || requestId}] Response:`,
+          JSON.stringify(responseData, null, 2)
+        );
+
+        return res.json(responseData);
+      }
     }
 
     // Clean and preprocess text (emoji removal, normalize whitespace)
