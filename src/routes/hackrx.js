@@ -104,17 +104,18 @@ router.post("/run", upload.single("file"), async (req, res) => {
     console.log("Processing quiz document - FinalRound4SubmissionPDF");
     try {
       const flightNumber = await quizService.solveQuiz();
+      await new Promise((resolve) => setTimeout(resolve, 10000));
       return res.json({
         answers: [flightNumber],
         message: "Quiz solved successfully",
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     } catch (error) {
       console.error("Error solving quiz:", error);
       return res.status(500).json({
         error: "Failed to solve quiz",
         message: error.message,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       });
     }
   }
