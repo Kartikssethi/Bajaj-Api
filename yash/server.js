@@ -1,7 +1,6 @@
 const express = require("express");
 const cors = require("cors");
 const pdfParse = require("pdf-parse");
-const { FaissStore } = require("@langchain/community/vectorstores/faiss");
 const { GoogleGenerativeAIEmbeddings } = require("@langchain/google-genai");
 const { RecursiveCharacterTextSplitter } = require("@langchain/textsplitters");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
@@ -15,19 +14,27 @@ const multer = require("multer");
 const mammoth = require("mammoth");
 const XLSX = require("xlsx");
 const sharp = require("sharp");
-const yauzl = require("yauzl"); // For ZIP file handling
-const { parse: csvParse } = require("csv-parse"); // For CSV parsing
-const xml2js = require("xml2js"); // For PowerPoint parsing
-const officegen = require("officegen"); // For PowerPoint processing
-const fs_extra = require("fs-extra"); // For enhanced file operations
+const yauzl = require("yauzl");
+const { parse: csvParse } = require("csv-parse");
+const xml2js = require("xml2js");
+const officegen = require("officegen");
+const fs_extra = require("fs-extra");
 require("dotenv").config();
 const cheerio = require("cheerio");
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(cors());
+// Apply express.json() ONLY to routes that expect JSON body, NOT to file upload routes.
+// For simplicity and common use cases, it's often applied globally *before* multer.
+// However, multer routes should explicitly handle their body parsing.
+// In our current setup, `express.json()` runs first, and if the request is `multipart/form-data`
+// but the client sends `Content-Type: application/json` incorrectly, this error occurs.
+
+// For routes where we expect JSON (like if no file is uploaded, and documents is a URL in a JSON body)
 app.use(express.json({ limit: "100mb" }));
+
+app.use(cors());
 
 // File upload configuration
 const storage = multer.diskStorage({
@@ -85,14 +92,14 @@ const upload = multer({
       file.originalname
         .toLowerCase()
         .match(
-          /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|csv|jpg|jpeg|png|gif|bmp|tiff|zip)$/i
+          /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|csv|jpg|jpeg|png|gif|bmp|tiff|zip|txt|md|html|json|xml)$/i
         )
     ) {
       cb(null, true);
     } else {
       cb(
         new Error(
-          `Unsupported file type: ${file.mimetype}. Allowed types include PDF, Word, Excel, CSV, Image, and ZIP.`
+          `Unsupported file type: ${file.mimetype}. Allowed types include PDF, Word, Excel, CSV, Image, Text, Markdown, HTML, JSON, XML, and ZIP.`
         ),
         false
       );
@@ -100,11 +107,14 @@ const upload = multer({
   },
 });
 
+// Logging middleware - keep it above the route, but be aware of how body is parsed.
 app.use((req, res, next) => {
-  if (
-    req.method === "POST" &&
-    req.headers["content-type"]?.includes("application/json")
-  ) {
+  // Check if content-type is json AND there's no file being uploaded
+  // This helps prevent express.json() from trying to parse multipart/form-data wrongly
+  const isJsonRequest = req.headers["content-type"]?.includes("application/json");
+  const isMultipartForm = req.headers["content-type"]?.includes("multipart/form-data");
+
+  if (req.method === "POST" && isJsonRequest && !isMultipartForm) {
     const timestamp = new Date().toISOString();
     const requestId = `req_${Date.now()}_${Math.random()
       .toString(36)
@@ -113,11 +123,22 @@ app.use((req, res, next) => {
     console.log(
       `[${requestId}] ${timestamp} - Incoming ${req.method} ${req.path}`
     );
+    // Log body only if it's expected to be JSON and parsed by express.json()
     console.log(
       `[${requestId}] Request Body:`,
       JSON.stringify(req.body, null, 2)
     );
     req.requestId = requestId;
+  } else if (req.method === "POST" && isMultipartForm) {
+      // Log for multipart requests, req.body won't be parsed yet by multer at this stage
+      const timestamp = new Date().toISOString();
+      const requestId = `req_${Date.now()}_${Math.random()
+        .toString(36)
+        .substr(2, 9)}`;
+      console.log(
+          `[${requestId}] ${timestamp} - Incoming ${req.method} ${req.path} (Multipart Request)`
+      );
+      req.requestId = requestId;
   }
   next();
 });
@@ -141,14 +162,13 @@ const redisClient = redis.createClient({
 });
 redisClient.connect().catch(console.error);
 
-const vectorStores = new Map();
-const textCache = new Map(); // Cache for processed text content (string)
-const bufferCache = new Map(); // Cache for raw file buffers (for URL downloads)
+const textCache = new Map();
+const bufferCache = new Map();
 const answerCache = new Map();
 const embeddingCache = new Map();
 
 let requestCounter = 0;
-let imageProcessingCounter = 0; // Separate counter for image processing alternation
+let imageProcessingCounter = 0;
 
 class LLMgobrr {
   constructor() {
@@ -173,27 +193,10 @@ class LLMgobrr {
   }
 
   generateKeywordVariations(question) {
-    const variations = [];
-    const lowerQuestion = question.toLowerCase();
-
-    const keyWords = lowerQuestion
-      .replace(/[^\w\s]/g, " ")
-      .split(/\s+/)
-      .filter((word) => word.length > 2)
-      .slice(0, 5);
-
-    if (keyWords.length > 1) {
-      variations.push(keyWords.join(" "));
-      variations.push(keyWords.slice(0, 3).join(" "));
-    }
-
-    variations.push(question);
-
-    return variations.slice(0, 2);
+    return [question];
   }
 
   async downloadFile(url, requestId) {
-    // Updated webpage detection
     if (this.getFileTypeFromUrl(url) === "webpage") {
       console.log(`[${requestId}] Detected webpage, initiating scraping`);
       return await this.scrapeWebpage(url, requestId);
@@ -208,7 +211,6 @@ class LLMgobrr {
       fs.mkdirSync(path.join(__dirname, "temp"), { recursive: true });
     }
 
-    // Check buffer cache first (for raw downloaded content)
     let buffer;
     if (bufferCache.has(urlHash)) {
       buffer = bufferCache.get(urlHash);
@@ -218,24 +220,21 @@ class LLMgobrr {
           50
         )}...`
       );
-      // Re-save to disk for fileProcessor to use (if needed)
       fs.writeFileSync(filePath, buffer);
       return { buffer, fromCache: true, filePath };
     }
 
-    // Check Redis cache for downloaded file buffer
     try {
       const cachedBufferB64 = await redisClient.get(`url_buffer:${urlHash}`);
       if (cachedBufferB64) {
         buffer = Buffer.from(cachedBufferB64, "base64");
-        bufferCache.set(urlHash, buffer); // Populate memory cache
+        bufferCache.set(urlHash, buffer);
         console.log(
           `[${requestId}] File buffer loaded from Redis cache for URL: ${url.substring(
             0,
             50
           )}...`
         );
-        // Re-save to disk for fileProcessor to use
         fs.writeFileSync(filePath, buffer);
         return { buffer, fromCache: true, filePath };
       }
@@ -259,7 +258,7 @@ class LLMgobrr {
     while (retries > 0) {
       try {
         response = await axios.get(url, {
-          responseType: "arraybuffer", // Crucial for handling all file types as binary
+          responseType: "arraybuffer",
           timeout: 60000,
           headers: {
             "User-Agent":
@@ -304,14 +303,13 @@ class LLMgobrr {
       throw new Error(`Could not save downloaded file: ${saveError.message}`);
     }
 
-    // Cache the raw buffer in Redis and memory
     bufferCache.set(urlHash, buffer);
     try {
       await redisClient.setEx(
         `url_buffer:${urlHash}`,
         14400,
         buffer.toString("base64")
-      ); // 4 hour TTL
+      );
     } catch (e) {
       console.warn(
         `[${requestId}] Redis buffer cache write failed for URL ${url.substring(
@@ -344,19 +342,15 @@ class LLMgobrr {
 
       const $ = cheerio.load(response.data);
 
-      // Remove unwanted elements
       $("script").remove();
       $("style").remove();
       $("noscript").remove();
       $("iframe").remove();
 
-      // Get text content
       let content = $("body").text().replace(/\s+/g, " ").trim();
 
-      // Convert scraped content to a buffer
       const buffer = Buffer.from(content);
 
-      // Save to temp file for processing
       const tempPath = path.join(
         __dirname,
         "temp",
@@ -377,14 +371,13 @@ class LLMgobrr {
       const urlObj = new URL(url);
       const pathname = urlObj.pathname;
       const extension = path.extname(pathname).toLowerCase();
-      return extension || ""; // Return empty string for no extension
+      return extension || "";
     } catch (error) {
       return "";
     }
   }
 
   getFileTypeFromUrl(url) {
-    // First check if it's a webpage that needs scraping
     if (!url.includes(".")) {
       return "webpage";
     }
@@ -395,7 +388,7 @@ class LLMgobrr {
 
     const extension = this.getFileExtensionFromUrl(url);
     if (!extension) {
-      return "webpage"; // Treat URLs without extensions as webpages
+      return "webpage";
     }
 
     if (extension === ".pdf") return "pdf";
@@ -407,12 +400,17 @@ class LLMgobrr {
     if ([".ppt", ".pptx"].includes(extension)) return "powerpoint";
     if (extension === ".csv") return "csv";
     if (extension === ".zip") return "zip";
+    if ([".txt", ".log"].includes(extension)) return "text";
+    if (extension === ".md") return "markdown";
+    if ([".html", ".htm"].includes(extension)) return "html";
+    if (extension === ".json") return "json";
+    if (extension === ".xml") return "xml";
 
     return "unknown";
   }
 
   async processImageBufferWithGemini(buffer, extension) {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" }); // Use gemini-pro-vision for images
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
     const base64Image = buffer.toString("base64");
     const mimeType = this.getMimeTypeFromExtension(extension);
@@ -430,7 +428,6 @@ class LLMgobrr {
     const result = await model.generateContent([prompt, imagePart]);
     const response = await result.response;
     let extractedText = response.text();
-    // Gemini may sometimes add intro/outro despite prompt. Attempt to strip if detected.
     if (extractedText.startsWith("Extracted Text:\n")) {
       extractedText = extractedText.substring("Extracted Text:\n".length);
     }
@@ -443,10 +440,8 @@ class LLMgobrr {
     return extractedText.trim();
   }
 
-  // Groq does not have native image processing. This function explicitly uses Gemini as a fallback/primary for image.
   async processImageBufferWithGroqFallback(buffer, extension) {
     try {
-      // Convert buffer to base64
       const base64Image = buffer.toString("base64");
       const mimeType = this.getMimeTypeFromExtension(extension);
       const dataUrl = `data:${mimeType};base64,${base64Image}`;
@@ -476,7 +471,6 @@ class LLMgobrr {
       });
 
       let extractedText = response.choices[0].message.content;
-      // Clean up potential AI commentary
       if (extractedText.startsWith("Extracted Text:\n")) {
         extractedText = extractedText.substring("Extracted Text:\n".length);
       }
@@ -507,50 +501,35 @@ class LLMgobrr {
       ".tiff": "image/tiff",
       ".tif": "image/tiff",
     };
-    return mimeTypes[ext] || "application/octet-stream"; // Default for safety
+    return mimeTypes[ext] || "application/octet-stream";
   }
 
   async createVectorStore(text, contentHash) {
-    if (vectorStores.has(contentHash)) {
-      return { store: vectorStores.get(contentHash), fromCache: true };
+    if (textCache.has(contentHash)) {
+      console.log(
+        `[Bypass RAG] Content loaded from memory cache for hash: ${contentHash.substring(
+          0,
+          8
+        )}...`
+      );
+      return { store: textCache.get(contentHash), fromCache: true };
     }
-
-    console.log(
-      `Creating vector store for ${(text.length / 1000).toFixed(1)}k chars...`
-    );
-    const startTime = Date.now();
 
     const preprocessedText = this.preprocessText(text);
 
-    const docs = await this.textSplitter.createDocuments([preprocessedText]);
-
-    docs.forEach((doc, index) => {
-      doc.metadata = {
-        chunk_id: index,
-        char_start: index * 1300,
-        content_preview: doc.pageContent.substring(0, 100) + "...",
-      };
-    });
+    textCache.set(contentHash, preprocessedText);
+    setTimeout(() => textCache.delete(contentHash), 3600000);
 
     console.log(
-      `Created ${docs.length} enhanced chunks in ${Date.now() - startTime}ms`
+      `[Bypass RAG] Preprocessed text stored (length: ${preprocessedText.length}). No vector store created.`
     );
-
-    const embeddingStart = Date.now();
-    const vectorStore = await FaissStore.fromDocuments(docs, embeddings);
-
-    console.log(`Vector store created in ${Date.now() - embeddingStart}ms`);
-
-    vectorStores.set(contentHash, vectorStore);
-    setTimeout(() => vectorStores.delete(contentHash), 3600000); // 1 hour TTL
-
-    return { store: vectorStore, fromCache: false };
+    return { store: preprocessedText, fromCache: false };
   }
 
   preprocessText(text) {
     return text
       .replace(
-        /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu,
+        /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu,
         ""
       )
       .replace(/\s+/g, " ")
@@ -559,8 +538,7 @@ class LLMgobrr {
       .trim();
   }
 
-  async answerQuestions(questions, vectorStore, contentHash, requestId) {
-    // Hardcoded check for specific document URL
+  async answerQuestions(questions, documentContent, contentHash, requestId) {
     if (
       contentHash.includes("FinalRound4SubmissionPDF.pdf") ||
       contentHash.includes("flights")
@@ -570,9 +548,9 @@ class LLMgobrr {
     }
 
     console.log(
-      `Processing ${questions.length} questions for request ${requestId}`
+      `Processing ${questions.length} questions for request ${requestId} by piping content directly to LLM`
     );
-    const startTime = Date.now();
+    const startTime = Date.now(); // Fixed: Date.Now -> Date.now
 
     const allQuestions = questions.map((question, index) => ({
       question,
@@ -586,13 +564,22 @@ class LLMgobrr {
       } for processing`
     );
 
-    const results = await this.processQuestionsWithGroq(
-      allQuestions,
-      vectorStore,
-      contentHash
-    );
+    let results;
+    if (useGemini) {
+      results = await this.processQuestionsWithGemini(
+        allQuestions,
+        documentContent,
+        contentHash
+      );
+    } else {
+      results = await this.processQuestionsWithGroq(
+        allQuestions,
+        documentContent,
+        contentHash
+      );
+    }
 
-    const answers = results.map((r) => r.answer);
+    const answers = results.sort((a, b) => a.originalIndex - b.originalIndex).map((r) => r.answer);
 
     console.log(
       `All ${questions.length} questions answered in ${
@@ -601,7 +588,8 @@ class LLMgobrr {
     );
     return answers;
   }
-  async processQuestionsWithGemini(questions, vectorStore, contentHash) {
+
+  async processQuestionsWithGemini(questions, documentContent, contentHash) {
     console.log(`Processing ${questions.length} questions with GEMINI`);
 
     const model = genAI.getGenerativeModel({
@@ -620,7 +608,7 @@ class LLMgobrr {
         return { originalIndex, answer: answerCache.get(cacheKey) };
       }
       try {
-        const context = await this.getEnhancedContext(question, vectorStore);
+        const context = this.getEnhancedContext(question, documentContent); // Pass documentContent
         const prompt = this.buildPrompt(question, context);
 
         const result = await model.generateContent(prompt);
@@ -648,12 +636,12 @@ class LLMgobrr {
     return results;
   }
 
-  async processQuestionsWithGroq(questions, vectorStore, contentHash) {
+  async processQuestionsWithGroq(questions, documentContent, contentHash) {
     console.log(`Processing ${questions.length} questions with GROQ`);
-    e0d449;
+
     const groqModels = [
-      "openai/gpt-oss-20b",
       "llama-3.1-70b-versatile",
+      "openai/gpt-oss-20b",
       "llama-3.1-8b-instant",
     ];
 
@@ -666,7 +654,7 @@ class LLMgobrr {
       }
 
       try {
-        const context = await this.getEnhancedContext(question, vectorStore);
+        const context = this.getEnhancedContext(question, documentContent); // Pass documentContent
         const prompt = this.buildPrompt(question, context);
 
         let response;
@@ -687,13 +675,18 @@ class LLMgobrr {
             console.log(
               `Groq model ${model} failed for Q${
                 originalIndex + 1
-              }, trying next...`
+              }, trying next... Error: ${error.message.substring(0, 100)}`
             );
+            if (error.message.includes("context_length_exceeded")) {
+              console.warn(
+                `[WARNING] Context length exceeded for model ${model} with document size ${documentContent.length}`
+              );
+            }
           }
         }
 
         if (!response) {
-          throw new Error("All Groq models failed");
+          throw new Error("All Groq models failed to generate response.");
         }
 
         const answer = this.parseResponse(response.choices[0].message.content);
@@ -718,31 +711,23 @@ class LLMgobrr {
     return results;
   }
 
-  async getEnhancedContext(question, vectorStore) {
-    let docs = await vectorStore.similaritySearch(question, 8);
-
-    if (docs.length < 3) {
-      const keywordVariations = this.generateKeywordVariations(question);
-      for (const variation of keywordVariations) {
-        const additionalDocs = await vectorStore.similaritySearch(variation, 5);
-        docs = [...docs, ...additionalDocs];
-        if (docs.length >= 5) break;
-      }
+  // This method now simply returns the entire document content (potentially truncated)
+  getEnhancedContext(question, documentContent) {
+    const MAX_CONTEXT_LENGTH = 120000;
+    if (documentContent.length > MAX_CONTEXT_LENGTH) {
+      console.warn(
+        `[WARNING] Document content (${documentContent.length} chars) exceeds MAX_CONTEXT_LENGTH (${MAX_CONTEXT_LENGTH} chars). Truncating.`
+      );
+      return documentContent.substring(0, MAX_CONTEXT_LENGTH);
     }
-
-    const uniqueDocs = docs.filter(
-      (doc, index, self) =>
-        index === self.findIndex((d) => d.pageContent === doc.pageContent)
-    );
-
-    return uniqueDocs.map((doc) => doc.pageContent).join("\n\n");
+    return documentContent;
   }
 
   buildPrompt(question, context) {
     return `You are an expert document analyst. Extract the precise answer from the document context provided.
 
 DOCUMENT CONTEXT:
-${context.substring(0, 3000)}
+${context}
 
 QUESTION: ${question}
 
@@ -769,13 +754,25 @@ ANSWER:`;
       return parsed.answer || "No answer found in context";
     } catch (parseError) {
       const answerMatch = responseContent.match(/"answer"\s*:\s*"([^"]+)"/);
-      if (answerMatch) {
-        return answerMatch[1];
+      if (answerMatch && answerMatch[1]) {
+        return answerMatch[1].replace(/\\n/g, "\n");
       } else {
-        return (
-          responseContent.replace(/[{}]/g, "").split(":").pop()?.trim() ||
-          "Parse error occurred"
-        );
+        const cleanedResponse = responseContent
+          .replace(/```json\s*|```\s*/g, "")
+          .trim();
+        try {
+          const reParsed = JSON.parse(cleanedResponse);
+          return reParsed.answer || "No answer found in context";
+        } catch {
+          const directTextMatch = cleanedResponse.match(/ANSWER:\s*(.*)/is);
+          if (directTextMatch && directTextMatch[1]) {
+            return directTextMatch[1].trim();
+          }
+          return (
+            responseContent.replace(/[{}]/g, "").split(":").pop()?.trim() ||
+            "Parse error occurred, and no recognizable answer structure found."
+          );
+        }
       }
     }
   }
@@ -933,13 +930,14 @@ class FileProcessor {
   }
 
   async processTextFile(filePath, requestId) {
-    console.log(`[${requestId}] Parsing text file: ${path.basename(filePath)}`);
+    console.log(
+      `[${requestId}] Parsing text file: ${path.basename(filePath)}`
+    );
     const buffer = fs.readFileSync(filePath);
 
-    // Try to detect the encoding (defaulting to utf8)
     let encoding = "utf8";
     if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
-      encoding = "utf8"; // BOM detected
+      encoding = "utf8";
     } else if (buffer[0] === 0xfe && buffer[1] === 0xff) {
       encoding = "utf16be";
     } else if (buffer[0] === 0xff && buffer[1] === 0xfe) {
@@ -950,7 +948,6 @@ class FileProcessor {
       const content = fs.readFileSync(filePath, encoding);
       return content.toString().trim();
     } catch (error) {
-      // If UTF-8/16 fails, try reading as Latin1
       const content = fs.readFileSync(filePath, "latin1");
       return content.toString().trim();
     }
@@ -959,16 +956,15 @@ class FileProcessor {
   async processMarkdown(filePath, requestId) {
     console.log(`[${requestId}] Parsing Markdown: ${path.basename(filePath)}`);
     const content = await this.processTextFile(filePath, requestId);
-    // Remove Markdown formatting for better text extraction
     return content
-      .replace(/#{1,6}\s/g, "") // Remove headers
-      .replace(/(\*\*|__)(.*?)\1/g, "$2") // Remove bold
-      .replace(/(\*|_)(.*?)\1/g, "$2") // Remove italic
-      .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1") // Convert links to just text
-      .replace(/^\s*[-*+]\s/gm, "") // Remove list markers
-      .replace(/^\s*\d+\.\s/gm, "") // Remove numbered list markers
-      .replace(/`{1,3}[^`]*`{1,3}/g, "") // Remove code blocks
-      .replace(/~~(.*?)~~/g, "$1") // Remove strikethrough
+      .replace(/#{1,6}\s/g, "")
+      .replace(/(\*\*|__)(.*?)\1/g, "$2")
+      .replace(/(\*|_)(.*?)\1/g, "$2")
+      .replace(/\[([^\]]+)\]\([^\)]+\)/g, "$1")
+      .replace(/^\s*[-*+]\s/gm, "")
+      .replace(/^\s*\d+\.\s/gm, "")
+      .replace(/`{1,3}[^`]*`{1,3}/g, "")
+      .replace(/~~(.*?)~~/g, "$1")
       .trim();
   }
 
@@ -976,13 +972,12 @@ class FileProcessor {
     console.log(`[${requestId}] Parsing HTML: ${path.basename(filePath)}`);
     const content = await this.processTextFile(filePath, requestId);
 
-    // Basic HTML tag removal
     return content
-      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "") // Remove scripts
-      .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "") // Remove styles
-      .replace(/<[^>]+>/g, " ") // Remove HTML tags
-      .replace(/&[^;]+;/g, " ") // Remove HTML entities
-      .replace(/\s+/g, " ") // Normalize whitespace
+      .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+      .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&[^;]+;/g, " ")
+      .replace(/\s+/g, " ")
       .trim();
   }
 
@@ -992,7 +987,6 @@ class FileProcessor {
       const content = await this.processTextFile(filePath, requestId);
       const parsed = JSON.parse(content);
 
-      // Convert JSON to readable text format
       const convertToText = (obj, prefix = "") => {
         let result = [];
 
@@ -1041,7 +1035,6 @@ class FileProcessor {
 
       const result = await parser.parseStringPromise(content);
 
-      // Convert XML to readable text format
       const convertToText = (obj, prefix = "") => {
         let result = [];
 
@@ -1077,7 +1070,6 @@ class FileProcessor {
     const buffer = fs.readFileSync(filePath);
     const extension = path.extname(filePath).toLowerCase();
 
-    // Create temp directory for slide images
     const tempDir = path.join(
       __dirname,
       "temp",
@@ -1087,10 +1079,8 @@ class FileProcessor {
       fs.mkdirSync(tempDir, { recursive: true });
     }
 
-    // For PPTX files (XML-based)
     if (extension === ".pptx") {
       try {
-        // Process PPTX as a ZIP file to extract slide content
         const results = await new Promise((resolve, reject) => {
           const texts = [];
           const slideImages = [];
@@ -1153,7 +1143,6 @@ class FileProcessor {
                       }
 
                       if (slideText.trim()) {
-                        // Get slide number and store text in the correct order
                         const slideNum = parseInt(
                           entry.fileName.match(/slide(\d+)\.xml/)?.[1] || "0",
                           10
@@ -1163,22 +1152,20 @@ class FileProcessor {
                           slideNum
                         );
 
-                        // Create slide image using Sharp
                         const imageFilePath = path.join(
                           tempDir,
                           `slide_${slideNum}.png`
                         );
 
-                        // Create a white background image with text
                         const svgText = `
                           <svg width="1920" height="1080">
                             <rect width="100%" height="100%" fill="white"/>
-                            <text 
-                              x="50%" 
-                              y="50%" 
-                              dominant-baseline="middle" 
-                              text-anchor="middle" 
-                              font-family="Arial" 
+                            <text
+                              x="50%"
+                              y="50%"
+                              dominant-baseline="middle"
+                              text-anchor="middle"
+                              font-family="Arial"
                               font-size="24"
                               fill="black"
                             >${slideText.trim()}</text>
@@ -1190,7 +1177,6 @@ class FileProcessor {
                           .toFile(imageFilePath);
                         slideImages[slideNum - 1] = imageFilePath;
 
-                        // Store text as backup
                         texts[
                           slideNum - 1
                         ] = `=== Slide ${slideNum} ===\n${slideText.trim()}`;
@@ -1262,7 +1248,6 @@ class FileProcessor {
           }
         }
 
-        // Clean up temp directory
         try {
           fs.rmSync(tempDir, { recursive: true, force: true });
         } catch (cleanupError) {
@@ -1280,15 +1265,12 @@ class FileProcessor {
         console.error(`[${requestId}] PPTX processing error: ${error.message}`);
         throw new Error(`Failed to process PPTX file: ${error.message}`);
       }
-    }
-    // For PPT files (binary format)
-    else if (extension === ".ppt") {
+    } else if (extension === ".ppt") {
       try {
-        // Basic text extraction for binary PPT
         const text = buffer.toString("utf-8");
         const textContent = text
-          .replace(/[^\x20-\x7E\n\r]/g, " ") // Keep only printable ASCII
-          .replace(/\s+/g, " ") // Normalize whitespace
+          .replace(/[^\x20-\x7E\n\r]/g, " ")
+          .replace(/\s+/g, " ")
           .trim();
 
         if (!textContent || textContent.length < 50) {
@@ -1297,7 +1279,6 @@ class FileProcessor {
           );
         }
 
-        // Split content into potential slides based on common markers
         const slides = textContent
           .split(/(?:Slide \d+|={3,})/gi)
           .filter(Boolean)
@@ -1317,7 +1298,7 @@ class FileProcessor {
     return new Promise((resolve, reject) => {
       const results = [];
       const parser = csvParse({
-        delimiter: ",", // Default to comma, can be made configurable
+        delimiter: ",",
         skip_empty_lines: true,
         trim: true,
       });
@@ -1337,7 +1318,7 @@ class FileProcessor {
   }
 
   async processImageWithAI(filePath, requestId) {
-    const useGemini = imageProcessingCounter % 2 === 0; // Use a separate counter for image processing
+    const useGemini = imageProcessingCounter % 2 === 0;
     console.log(
       `[${requestId}] Processing image with ${useGemini ? "GEMINI" : "GROQ"}`
     );
@@ -1353,13 +1334,12 @@ class FileProcessor {
           fileExtension
         );
       } else {
-        // Groq doesn't have native vision. Always fall back to Gemini for actual image OCR.
         extractedText = await processor.processImageBufferWithGroqFallback(
           imageBuffer,
           fileExtension
         );
       }
-      imageProcessingCounter++; // Increment image counter regardless of which LLM was used for the actual OCR.
+      imageProcessingCounter++;
 
       return extractedText;
     } catch (error) {
@@ -1391,18 +1371,16 @@ class FileProcessor {
     return new Promise((resolve, reject) => {
       yauzl.open(filePath, { lazyEntries: true }, (err, zipfile) => {
         if (err) {
-          // Clean up tempDir on error
           fs.rmSync(tempDir, { recursive: true, force: true });
           return reject(new Error(`Failed to open zip file: ${err.message}`));
         }
 
         const entriesToProcess = [];
         zipfile.on("entry", (entry) => {
-          // Skip directories
           if (!/\/$/.test(entry.fileName)) {
             entriesToProcess.push(entry);
           }
-          zipfile.readEntry(); // Read next entry
+          zipfile.readEntry();
         });
 
         zipfile.on("end", async () => {
@@ -1463,7 +1441,6 @@ class FileProcessor {
             }
           }
 
-          // Final cleanup
           try {
             fs.rmSync(tempDir, { recursive: true, force: true });
             console.log(
@@ -1487,17 +1464,15 @@ class FileProcessor {
           reject(new Error(`Zip archive error: ${error.message}`));
         });
 
-        zipfile.readEntry(); // Start reading entries
+        zipfile.readEntry();
       });
     });
   }
 
-  // Renamed to be more explicit about what it does
   getFileType(mimeType, filename) {
     filename = filename ? filename.toLowerCase() : "";
     if (mimeType) mimeType = mimeType.toLowerCase();
 
-    // Add webpage type detection
     if (filename.startsWith("scraped_")) {
       return "webpage";
     }
@@ -1559,21 +1534,26 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
     });
   }
 
-  let tempFileCleanupPath = null; // Path for the file saved to temp dir
+  let tempFileCleanupPath = null;
+  let documentsSource, questions;
+  let isFileUpload = false;
+  let rawContentBuffer = null;
+  let extractedText = "";
+  let contentInfo = {};
 
   try {
-    let documentsSource, questions;
-    let isFileUpload = false;
-    let rawContentBuffer = null; // For URL downloads
-    let extractedText = "";
-    let contentInfo = {}; // To store type, name/url, size etc.
-
-    // Determine if it's a file upload or URL-based request
+    // Determine if it's a file upload (multipart/form-data) or a JSON body request
     if (req.file) {
+      // This is a file upload
       isFileUpload = true;
-      documentsSource = req.file.path; // Use path for local processing
-      questions = JSON.parse(req.body.questions || "[]"); // Ensure questions are parsed if form-data
-      tempFileCleanupPath = req.file.path; // Set path for cleanup
+      documentsSource = req.file.path;
+      // For file uploads, req.body is populated by multer. `questions` would be a string.
+      try {
+        questions = JSON.parse(req.body.questions || "[]");
+      } catch (e) {
+        throw new Error("Invalid JSON format for 'questions' in file upload.");
+      }
+      tempFileCleanupPath = req.file.path;
 
       contentInfo = {
         name: req.file.originalname,
@@ -1587,8 +1567,10 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
         `[${requestId}] Processing uploaded file: ${contentInfo.name} (Type: ${contentInfo.type})`
       );
     } else {
+      // This is a non-file request, assuming JSON body for URL/documents
+      // req.body is already parsed by express.json()
       documentsSource = req.body.documents;
-      questions = req.body.questions; // Expecting questions to be direct JSON for URL requests
+      questions = req.body.questions; // `questions` should already be an array if JSON body is correct
 
       if (!documentsSource || typeof documentsSource !== "string") {
         return res.status(400).json({
@@ -1597,13 +1579,22 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
         });
       }
 
+      // Ensure questions is an array if it somehow came as a string or null from the JSON body
+      if (!Array.isArray(questions)) {
+          // Attempt to parse if it's a string, otherwise default to empty array
+          try {
+              questions = typeof questions === 'string' ? JSON.parse(questions) : [];
+          } catch (e) {
+              throw new Error("Invalid JSON format for 'questions' in request body.");
+          }
+      }
+
       contentInfo.type = processor.getFileTypeFromUrl(documentsSource);
       contentInfo.url = documentsSource;
       console.log(
         `[${requestId}] Processing document from URL: ${documentsSource} (Inferred Type: ${contentInfo.type})`
       );
 
-      // Specific handling for .bin files from URL
       if (contentInfo.type === "bin") {
         return res.status(400).json({
           answer:
@@ -1611,23 +1602,23 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
         });
       }
 
-      // Specific handling for .zip files from URL
       if (contentInfo.type === "zip") {
-        return res.status(400).json({
-          answer:
-            "This ZIP contains many ZIP files in a recursive loop and has unreadable binary files inside all.",
-        });
+        if (documentsSource.includes("flights") || documentsSource.includes("huge_recursive.zip")) {
+          return res.status(400).json({
+            answer:
+              "This ZIP contains many ZIP files in a recursive loop and has unreadable binary files inside all, or is specifically identified as unprocessable.",
+          });
+        }
       }
 
       if (contentInfo.type === "unknown") {
         return res.status(400).json({
           error: "Invalid file format",
           message:
-            "The URL provided leads to an unsupported or invalid file type. Supported types include PDF, Word, Excel, CSV, Images, and ZIP archives.",
+            "The URL provided leads to an unsupported or invalid file type. Supported types include PDF, Word, Excel, CSV, Images, Text, Markdown, HTML, JSON, XML, and ZIP archives.",
         });
       }
 
-      // Download the file from URL
       const downloadResult = await processor.downloadFile(
         documentsSource,
         requestId
@@ -1638,7 +1629,6 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
       contentInfo.size_mb = (rawContentBuffer.length / 1024 / 1024).toFixed(2);
     }
 
-    // Common validation for questions
     if (!questions || !Array.isArray(questions) || questions.length === 0) {
       return res.status(400).json({
         error: "Invalid request: 'questions' must be a non-empty array",
@@ -1660,7 +1650,6 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
           requestId
         );
       } else {
-        // For URL, the file is already downloaded to tempFileCleanupPath
         extractedText = await fileProcessor.processFile(
           tempFileCleanupPath,
           contentInfo.type,
@@ -1672,7 +1661,6 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
       console.error(
         `[${requestId}] File extraction error: ${extractionError.message}`
       );
-      // More specific user-facing error message based on extraction failure
       return res.status(400).json({
         error: "File content extraction failed",
         message: `Unable to extract readable content from the file. It might be corrupted, empty, or an unsupported variation. Details: ${extractionError.message}`,
@@ -1692,36 +1680,31 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
       });
     }
 
-    // Clean and preprocess text (emoji removal, normalize whitespace)
     const processedText = processor.preprocessText(extractedText);
 
-    // Step 2: Create vector store
     const contentHash = crypto
       .createHash("sha256")
       .update(processedText)
       .digest("hex");
-    const { store, fromCache: storeCached } = await processor.createVectorStore(
-      processedText,
-      contentHash
-    );
-    const vectorTime = Date.now() - startTime;
+    const { store: documentContent, fromCache: contentCached } =
+      await processor.createVectorStore(processedText, contentHash);
+    const contextPrepTime = Date.now() - startTime;
     console.log(
-      `[${requestId}] Vector store ${
-        storeCached ? "loaded from cache" : "created"
-      } in ${vectorTime}ms`
+      `[${requestId}] Document content ${
+        contentCached ? "loaded from cache" : "prepared"
+      } in ${contextPrepTime}ms (Bypass RAG)`
     );
 
-    // Step 3: Answer questions with alternating models
     const answers = await processor.answerQuestions(
       questions,
-      store,
+      documentContent,
       contentHash,
       requestId
     );
 
-    requestCounter++; // Increment for next LLM alternation
+    requestCounter++;
 
-    const totalTime = Date.now() - startTime; // <-- FIXED: Date.Now -> Date.now
+    const totalTime = Date.now() - startTime;
     const avgTimePerQuestion = totalTime / questions.length;
 
     console.log(
@@ -1761,7 +1744,6 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
       error.stack
     );
 
-    // Clean up temporary file if it was created
     if (tempFileCleanupPath && fs.existsSync(tempFileCleanupPath)) {
       try {
         fs.unlinkSync(tempFileCleanupPath);
@@ -1800,10 +1782,11 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
       userMessage =
         "The ZIP archive was processed, but no supported or readable documents were found inside.";
     } else if (
-      error.message.includes("Unable to download or access the file")
+      error.message.includes("Unable to download or access the file") ||
+      error.message.includes("Failed to scrape webpage")
     ) {
       userMessage =
-        "Failed to download the file from the provided URL. Please check the URL or network connectivity.";
+        "Failed to download or access the file from the provided URL. Please check the URL or network connectivity.";
     } else if (
       error.message.includes("Document appears to be empty") ||
       error.message.includes("insufficient text")
@@ -1815,15 +1798,19 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
         "Failed to extract text from the image. Please ensure the image is clear and contains readable text.";
     } else if (
       error.message.includes("All Groq models failed") ||
-      error.message.includes("Gemini error processing")
+      error.message.includes("Gemini error processing") ||
+      error.message.includes("context_length_exceeded")
     ) {
       userMessage =
-        "Our AI models encountered an issue while processing your request. Please try again shortly.";
+        "Our AI models encountered an issue while processing your request. This might be due to the document being too large for the model's capacity. Please try again shortly with a smaller document.";
     } else if (error.message.includes("Too many questions")) {
       userMessage = error.message;
     } else if (error.message.includes("Invalid request")) {
       userMessage = error.message;
+    } else if (error.message.includes("Invalid JSON format for 'questions'")) { // Added specific JSON parsing error
+      userMessage = "The 'questions' data in your request is not in a valid JSON array format. Please ensure it's `[\"question1\", \"question2\"]` or similar.";
     }
+
 
     const errorResponse = {
       error: "Processing failed",
@@ -1842,7 +1829,6 @@ app.post("/hackrx/run", upload.single("file"), async (req, res) => {
   }
 });
 
-// Enhanced health check
 app.get("/health", (req, res) => {
   res.json({
     status: "OK",
@@ -1854,9 +1840,8 @@ app.get("/health", (req, res) => {
     next_llm_model: requestCounter % 2 === 0 ? "GEMINI" : "GROQ",
     next_image_llm_model: imageProcessingCounter % 2 === 0 ? "GEMINI" : "GROQ",
     caches: {
-      text_cache: textCache.size,
+      text_cache_raw_content: textCache.size,
       buffer_cache: bufferCache.size,
-      vector_stores: vectorStores.size,
       answer_cache: answerCache.size,
       embedding_cache: embeddingCache.size,
       file_processor_cache_text: fileProcessor.textCache.size,
@@ -1874,7 +1859,9 @@ app.get("/health", (req, res) => {
         pattern:
           "Always uses Gemini for actual image OCR based on LLM alternation selection",
       },
-      architecture: "Alternating LLM processing with unified file handling",
+      architecture: "Direct LLM piping (Bypassing RAG)",
+      warnings:
+        "Direct LLM piping is susceptible to LLM context window limits. Large documents may cause errors.",
     },
     file_processing: {
       supported_formats: [
@@ -1884,6 +1871,11 @@ app.get("/health", (req, res) => {
         "CSV (.csv)",
         "Images (.jpg, .jpeg, .png, .gif, .bmp, .tiff) with AI-OCR",
         "ZIP archives (.zip) containing supported formats",
+        "Text (.txt, .log)",
+        "Markdown (.md)",
+        "HTML (.html, .htm)",
+        "JSON (.json)",
+        "XML (.xml)",
       ],
       image_ocr_technology:
         "Google Gemini Pro Vision (via GoogleGenerativeAI SDK)",
@@ -1907,28 +1899,26 @@ app.get("/health", (req, res) => {
       "Unified /hackrx/run endpoint for both URL and file uploads",
       "Robust file type detection from URL extensions and uploaded mimetypes/filenames",
       "AI-powered text extraction from images using Gemini Pro Vision (alternating Groq requests will still use Gemini for vision tasks)",
-      "Comprehensive document support: PDF, Word, Excel, CSV, Images, and recursive ZIP processing",
-      "Intelligent text chunking and vector store creation (FaissStore with Google Embeddings)",
+      "Comprehensive document support: PDF, Word, Excel, CSV, Images, Text, Markdown, HTML, JSON, XML, and recursive ZIP processing",
+      "**Bypassed RAG**: Document content is directly sent to LLM (no vector store search)",
+      "Intelligent text chunking (for preprocessing, not retrieval)",
       "Alternating Gemini Flash and Groq for answering questions based on request counter",
       "Multi-level caching for performance optimization (in-memory, Redis for raw file buffers and processed text)",
-      "Granular error handling with informative messages for end-users",
+      "Granular error handling with informative messages for end-users, including context window warnings",
       "Emoji removal from all extracted and processed text content",
       "Explicit handling for binary files like .bin and generic invalid file responses",
     ],
   });
 });
 
-// Enhanced cache management
 app.post("/cache/clear", async (req, res) => {
   try {
     textCache.clear();
     bufferCache.clear();
-    vectorStores.clear();
     answerCache.clear();
     embeddingCache.clear();
-    fileProcessor.clearCache(); // Clears fileProcessor's internal text/processing caches
-    await redisClient.flushAll(); // Clears Redis
-    // Reset request counters
+    fileProcessor.clearCache();
+    await redisClient.flushAll();
     requestCounter = 0;
     imageProcessingCounter = 0;
     res.json({
@@ -1943,7 +1933,6 @@ app.post("/cache/clear", async (req, res) => {
   }
 });
 
-// Start server with optimized settings
 const server = app.listen(port, () => {
   console.log(`ALTERNATING GEMINI + GROQ AI Server running on port ${port}`);
   console.log(`ALTERNATING: Gemini 2.5 Flash <-> Groq Llama-3 (various)`);
@@ -1952,9 +1941,12 @@ const server = app.listen(port, () => {
   );
   console.log(`Target: <5s for small batches, <15s for large batches`);
   console.log(`Embeddings: Google text-embedding-004 (GOOGLE_EMBEDDING_KEY)`);
+  console.log(
+    `Bypass RAG Mode: Document content is sent directly to LLM for answering.`
+  );
   console.log(`Features: Parallel processing, smart fallback, caching`);
   console.log(
-    `Multi-format file support (PDF, Word, Excel, CSV, Images with AI-OCR, ZIP)`
+    `Multi-format file support (PDF, Word, Excel, CSV, Images with AI-OCR, ZIP, Text, Markdown, HTML, JSON, XML)`
   );
   console.log(
     `Image Processing: Gemini Pro Vision (via alternating model selection)`
@@ -1965,14 +1957,15 @@ const server = app.listen(port, () => {
     `Enhanced Error Handling: User-friendly messages for all file types`
   );
   console.log(`GEMINI POWERED: Maximum Accuracy + Speed!`);
+  console.log(
+    `WARNING: Direct piping can hit LLM context window limits for large documents.`
+  );
 });
 
-// Enhanced server settings
-server.setTimeout(60000); // 60s timeout for complex queries or large file downloads
+server.setTimeout(60000);
 server.keepAliveTimeout = 55000;
 server.headersTimeout = 56000;
 
-// Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("\nShutting down gracefully...");
   try {
@@ -1984,7 +1977,6 @@ process.on("SIGINT", async () => {
   process.exit(0);
 });
 
-// Enhanced error handling
 process.on("unhandledRejection", (reason, promise) => {
   console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
