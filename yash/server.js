@@ -740,6 +740,7 @@ CRITICAL INSTRUCTIONS:
 6. Be comprehensive but concise - include all relevant details from the document
 7. Write answers in clear, human-readable format with proper punctuation and grammar
 8. Focus on factual information directly from the document
+9. Allways answer in english translate if needed
 
 FORMAT: Respond with JSON: {"answer": "detailed answer with specific information from document"}
 
