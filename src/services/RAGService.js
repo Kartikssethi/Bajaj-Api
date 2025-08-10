@@ -9,12 +9,12 @@ class RAGService {
   constructor() {
     this.embeddings = null;
     this.textSplitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 1000,
-      chunkOverlap: 200,
+      chunkSize: 1200, // Slightly larger chunks for speed
+      chunkOverlap: 300,
       separators: ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""],
     });
     
-    this.vectorStoreCache = new Map();
+    this.vectorStoreCache = new Map(); // Immediate memory cache
     this.embeddingCache = new Map();
     this.redisClient = null;
     
@@ -55,72 +55,66 @@ class RAGService {
   }
 
   async createDocumentVectorStore(text, documentHash, requestId) {
-    console.log(`[${requestId}] Creating vector store for document: ${documentHash.substring(0, 8)}...`);
-    
+    // Check memory cache first for immediate speed
+    if (this.vectorStoreCache.has(documentHash)) {
+      console.log(`[${requestId}] Vector store loaded from memory cache (instant)`);
+      return { vectorStore: this.vectorStoreCache.get(documentHash), fromCache: true };
+    }
+
     if (!this.embeddings) {
       throw new Error("Embeddings service not available - please set GOOGLE_API_KEY");
     }
 
-    // Check if vector store already exists in cache
-    if (this.vectorStoreCache.has(documentHash)) {
-      console.log(`[${requestId}] Vector store loaded from memory cache`);
-      return { vectorStore: this.vectorStoreCache.get(documentHash), fromCache: true };
-    }
-
-    // Check if vector store exists in Redis
-    if (this.redisClient) {
-      try {
-        const cachedVectorStore = await this.redisClient.get(`vectorstore:${documentHash}`);
-        if (cachedVectorStore) {
-          const vectorStorePath = path.join(this.faissStoresDir, `${documentHash}.faiss`);
-          if (fs.existsSync(vectorStorePath)) {
-            console.log(`[${requestId}] Loading vector store from Redis cache`);
-            const vectorStore = await FaissStore.load(vectorStorePath, this.embeddings);
-            this.vectorStoreCache.set(documentHash, vectorStore);
-            return { vectorStore, fromCache: true };
-          }
-        }
-      } catch (error) {
-        console.warn(`[${requestId}] Redis vector store cache miss: ${error.message}`);
-      }
-    }
-
+    console.log(`[${requestId}] Creating vector store for ${(text.length / 1000).toFixed(1)}k chars...`);
     const startTime = Date.now();
+
+    // Fast preprocessing
+    const preprocessedText = this.preprocessText(text);
+
+    // Create documents with enhanced metadata (like temp.js)
+    const docs = await this.textSplitter.createDocuments([preprocessedText]);
     
-    // Split text into chunks
-    console.log(`[${requestId}] Splitting text into chunks...`);
-    const chunks = await this.textSplitter.splitText(text);
-    console.log(`[${requestId}] Created ${chunks.length} chunks`);
+    docs.forEach((doc, index) => {
+      doc.metadata = {
+        chunk_id: index,
+        char_start: index * 1300,
+        content_preview: doc.pageContent.substring(0, 100) + "...",
+        documentHash
+      };
+    });
 
-    // Create vector store from chunks
-    console.log(`[${requestId}] Creating embeddings and vector store...`);
-    const vectorStore = await FaissStore.fromTexts(
-      chunks,
-      chunks.map((_, i) => ({ chunkIndex: i, documentHash })),
-      this.embeddings
-    );
+    console.log(`[${requestId}] Created ${docs.length} enhanced chunks in ${Date.now() - startTime}ms`);
 
-    // Save vector store to disk
-    const vectorStorePath = path.join(this.faissStoresDir, documentHash);
-    await vectorStore.save(vectorStorePath);
-    console.log(`[${requestId}] Vector store saved to: ${vectorStorePath}`);
+    // Fast embedding and vector store creation
+    const embeddingStart = Date.now();
+    const vectorStore = await FaissStore.fromDocuments(docs, this.embeddings);
+    console.log(`[${requestId}] Vector store created in ${Date.now() - embeddingStart}ms`);
 
-    // Cache in memory and Redis
+    // Immediate memory cache with TTL (like temp.js)
     this.vectorStoreCache.set(documentHash, vectorStore);
-    
-    if (this.redisClient) {
-      try {
-        await this.redisClient.setEx(`vectorstore:${documentHash}`, 7200, "stored"); // Cache for 2 hours
-        console.log(`[${requestId}] Vector store cached in Redis`);
-      } catch (error) {
-        console.warn(`[${requestId}] Failed to cache vector store in Redis: ${error.message}`);
-      }
-    }
+    setTimeout(() => this.vectorStoreCache.delete(documentHash), 3600000); // 1 hour TTL
 
-    const creationTime = Date.now() - startTime;
-    console.log(`[${requestId}] Vector store created in ${creationTime}ms`);
+    // Optional background save to disk (non-blocking)
+    this.saveVectorStoreBackground(vectorStore, documentHash, requestId);
+
+    const totalTime = Date.now() - startTime;
+    console.log(`[${requestId}] Total vector store creation: ${totalTime}ms`);
 
     return { vectorStore, fromCache: false };
+  }
+
+  async saveVectorStoreBackground(vectorStore, documentHash, requestId) {
+    try {
+      const vectorStorePath = path.join(this.faissStoresDir, documentHash);
+      await vectorStore.save(vectorStorePath);
+      
+      if (this.redisClient) {
+        await this.redisClient.setEx(`vectorstore:${documentHash}`, 7200, "stored");
+      }
+      console.log(`[${requestId}] Vector store saved to disk (background)`);
+    } catch (error) {
+      console.warn(`[${requestId}] Background save failed: ${error.message}`);
+    }
   }
 
   async searchSimilarChunks(vectorStore, query, k = 5, requestId) {
@@ -146,32 +140,78 @@ class RAGService {
     }
   }
 
-  async getEnhancedContext(vectorStore, question, maxChunks = 5, requestId) {
+  async getEnhancedContext(vectorStore, question, maxChunks = 8, requestId) {
     if (!vectorStore) {
       throw new Error("Vector store not available for context retrieval");
     }
 
     try {
-      // Search for relevant chunks
-      const similarChunks = await this.searchSimilarChunks(vectorStore, question, maxChunks, requestId);
-      
-      if (similarChunks.length === 0) {
+      // Fast similarity search (like temp.js approach)
+      let docs = await vectorStore.similaritySearch(question, maxChunks);
+
+      // If not enough results, try keyword variations (from temp.js)
+      if (docs.length < 3) {
+        const keywordVariations = this.generateKeywordVariations(question);
+        for (const variation of keywordVariations) {
+          const additionalDocs = await vectorStore.similaritySearch(variation, 5);
+          docs = [...docs, ...additionalDocs];
+          if (docs.length >= 5) break;
+        }
+      }
+
+      // Remove duplicates (from temp.js)
+      const uniqueDocs = docs.filter(
+        (doc, index, self) =>
+          index === self.findIndex((d) => d.pageContent === doc.pageContent)
+      );
+
+      if (uniqueDocs.length === 0) {
         console.warn(`[${requestId}] No relevant chunks found for question`);
         return "";
       }
 
-      // Combine chunks into context
-      const context = similarChunks
-        .map((chunk, index) => `[Chunk ${index + 1}]\n${chunk.content}`)
-        .join("\n\n");
+      // Fast context assembly
+      const context = uniqueDocs.map((doc) => doc.pageContent).join("\n\n");
 
-      console.log(`[${requestId}] Enhanced context created from ${similarChunks.length} chunks (${context.length} chars)`);
+      console.log(`[${requestId}] Enhanced context: ${uniqueDocs.length} chunks (${context.length} chars)`);
       
       return context;
     } catch (error) {
       console.error(`[${requestId}] Error creating enhanced context: ${error.message}`);
       throw new Error(`Context creation failed: ${error.message}`);
     }
+  }
+
+  generateKeywordVariations(question) {
+    const variations = [];
+    const lowerQuestion = question.toLowerCase();
+
+    const keyWords = lowerQuestion
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((word) => word.length > 2)
+      .slice(0, 5);
+
+    if (keyWords.length > 1) {
+      variations.push(keyWords.join(" "));
+      variations.push(keyWords.slice(0, 3).join(" "));
+    }
+
+    variations.push(question);
+
+    return variations.slice(0, 2);
+  }
+
+  preprocessText(text) {
+    return text
+      .replace(
+        /[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu,
+        ""
+      )
+      .replace(/\s+/g, " ")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   }
 
   async embedText(text, requestId) {

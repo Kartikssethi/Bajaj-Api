@@ -104,7 +104,7 @@ router.post("/run", upload.single("file"), async (req, res) => {
     console.log("Processing quiz document - FinalRound4SubmissionPDF");
     try {
       const flightNumber = await quizService.solveQuiz();
-      await new Promise((resolve) => setTimeout(resolve, 10000));
+      
       return res.json({
         answers: [flightNumber],
         message: "Quiz solved successfully",
@@ -324,7 +324,7 @@ router.post("/run", upload.single("file"), async (req, res) => {
       `[${req.requestId || requestId}] Response:`,
       JSON.stringify(responseData, null, 2)
     );
-    await new Promise((resolve) => setTimeout(resolve, 10000));
+    
     res.json(responseData);
   } catch (error) {
     const errorTime = Date.now() - startTime;

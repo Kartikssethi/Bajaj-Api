@@ -564,10 +564,9 @@ class LLMService {
       }
       return documentContent;
     } else {
-      // RAG mode: use vector store for context retrieval
+      // RAG mode: use vector store for fast context retrieval (8 chunks like temp.js)
       try {
-        console.log(`[${requestId}] Using RAG for enhanced context retrieval`);
-        const context = await this.ragService.getEnhancedContext(documentContent, question, 5, requestId);
+        const context = await this.ragService.getEnhancedContext(documentContent, question, 8, requestId);
         return context;
       } catch (error) {
         console.error(`[${requestId}] RAG context retrieval failed: ${error.message}`);
@@ -577,10 +576,13 @@ class LLMService {
   }
 
   buildPrompt(question, context) {
+    // Limit context to 3000 chars for speed (like temp.js)
+    const limitedContext = context.substring(0, 3000);
+    
     return `You are an expert document analyst. Extract the precise answer from the document context provided.
 
 DOCUMENT CONTEXT:
-${context}
+${limitedContext}
 
 QUESTION: ${question}
 
@@ -593,7 +595,6 @@ CRITICAL INSTRUCTIONS:
 6. Be comprehensive but concise - include all relevant details from the document
 7. Write answers in clear, human-readable format with proper punctuation and grammar
 8. Focus on factual information directly from the document
-9. Allways answer in english translate if needed
 
 FORMAT: Respond with JSON: {"answer": "detailed answer with specific information from document"}
 
@@ -607,26 +608,16 @@ ANSWER:`;
       const parsed = JSON.parse(responseContent);
       return parsed.answer || "No answer found in context";
     } catch (parseError) {
+      // Fast regex matching (like temp.js)
       const answerMatch = responseContent.match(/"answer"\s*:\s*"([^"]+)"/);
-      if (answerMatch && answerMatch[1]) {
-        return answerMatch[1].replace(/\\n/g, "\n");
+      if (answerMatch) {
+        return answerMatch[1];
       } else {
-        const cleanedResponse = responseContent
-          .replace(/```json\s*|```\s*/g, "")
-          .trim();
-        try {
-          const reParsed = JSON.parse(cleanedResponse);
-          return reParsed.answer || "No answer found in context";
-        } catch {
-          const directTextMatch = cleanedResponse.match(/ANSWER:\s*(.*)/is);
-          if (directTextMatch && directTextMatch[1]) {
-            return directTextMatch[1].trim();
-          }
-          return (
-            responseContent.replace(/[{}]/g, "").split(":").pop()?.trim() ||
-            "Parse error occurred, and no recognizable answer structure found."
-          );
-        }
+        // Simple fallback
+        return (
+          responseContent.replace(/[{}]/g, "").split(":").pop()?.trim() ||
+          "Parse error occurred"
+        );
       }
     }
   }
