@@ -68,8 +68,10 @@ app.get("/", (req, res) => {
     endpoints: {
       health: "/health",
       api: "",
-      hackrx: "/hackrx/run",
+      hackrx: "/hackrx/run (with RAG support)",
       cache: "/cache",
+      ragStats: "/cache/rag/stats", 
+      ragClear: "/cache/rag/clear",
       quiz: "/quiz/solve",
     },
     timestamp: new Date().toISOString(),
@@ -84,8 +86,10 @@ app.use((req, res) => {
     availableEndpoints: {
       health: "/health",
       api: "",
-      hackrx: "/hackrx/run",
+      hackrx: "/hackrx/run (with RAG support)",
       cache: "/cache",
+      ragStats: "/cache/rag/stats",
+      ragClear: "/cache/rag/clear",
       quiz: "/quiz/solve",
     },
     timestamp: new Date().toISOString(),
@@ -112,8 +116,9 @@ app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
   console.log(`📊 Health check: http://localhost:${port}/health`);
   console.log(`🔗 API base: http://localhost:${port}`);
-  console.log(`📝 Main endpoint: http://localhost:${port}/hackrx/run`);
+  console.log(`📝 Main endpoint (RAG): http://localhost:${port}/hackrx/run`);
   console.log(`🗄️  Cache management: http://localhost:${port}/cache`);
+  console.log(`🧠 RAG stats: http://localhost:${port}/cache/rag/stats`);
 });
 
 module.exports = app;

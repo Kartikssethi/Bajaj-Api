@@ -1,6 +1,7 @@
 const { RecursiveCharacterTextSplitter } = require("@langchain/textsplitters");
 const { genAI, groq } = require("../config/ai");
 const { answerCache } = require("../utils/cache");
+const RAGService = require("./RAGService");
 
 class LLMService {
   constructor() {
@@ -22,6 +23,9 @@ class LLMService {
       timeout: 15000,
       rejectUnauthorized: false,
     });
+
+    // Initialize RAG service
+    this.ragService = new RAGService();
 
     // Check if AI services are available
     this.hasGemini = !!genAI;
@@ -316,28 +320,35 @@ class LLMService {
     }
   }
 
-  async createVectorStore(text, contentHash) {
-    const { textCache } = require("../utils/cache");
-
-    if (textCache.has(contentHash)) {
-      console.log(
-        `[Bypass RAG] Content loaded from memory cache for hash: ${contentHash.substring(
-          0,
-          8
-        )}...`
+  async createVectorStore(text, contentHash, requestId = "unknown") {
+    try {
+      const preprocessedText = this.preprocessText(text);
+      console.log(`[${requestId}] Creating RAG vector store for document: ${contentHash.substring(0, 8)}...`);
+      
+      const { vectorStore, fromCache } = await this.ragService.createDocumentVectorStore(
+        preprocessedText, 
+        contentHash, 
+        requestId
       );
-      return { store: textCache.get(contentHash), fromCache: true };
+      
+      console.log(
+        `[${requestId}] RAG vector store ${fromCache ? "loaded from cache" : "created"} successfully`
+      );
+      
+      return { store: vectorStore, fromCache };
+    } catch (error) {
+      console.error(`[${requestId}] RAG vector store creation failed: ${error.message}`);
+      console.log(`[${requestId}] Falling back to direct text processing`);
+      
+      // Fallback to direct text processing if RAG fails
+      const { textCache } = require("../utils/cache");
+      const preprocessedText = this.preprocessText(text);
+      
+      textCache.set(contentHash, preprocessedText);
+      setTimeout(() => textCache.delete(contentHash), 3600000);
+      
+      return { store: preprocessedText, fromCache: false, fallback: true };
     }
-
-    const preprocessedText = this.preprocessText(text);
-
-    textCache.set(contentHash, preprocessedText);
-    setTimeout(() => textCache.delete(contentHash), 3600000);
-
-    console.log(
-      `[Bypass RAG] Preprocessed text stored (length: ${preprocessedText.length}). No vector store created.`
-    );
-    return { store: preprocessedText, fromCache: false };
   }
 
   preprocessText(text) {
@@ -432,7 +443,7 @@ class LLMService {
         return { originalIndex, answer: answerCache.get(cacheKey) };
       }
       try {
-        const context = this.getEnhancedContext(question, documentContent);
+        const context = await this.getEnhancedContext(question, documentContent, `gemini-q${originalIndex + 1}`);
         const prompt = this.buildPrompt(question, context);
 
         const result = await model.generateContent(prompt);
@@ -482,7 +493,7 @@ class LLMService {
       }
 
       try {
-        const context = this.getEnhancedContext(question, documentContent);
+        const context = await this.getEnhancedContext(question, documentContent, `groq-q${originalIndex + 1}`);
         const prompt = this.buildPrompt(question, context);
 
         let response;
@@ -506,8 +517,9 @@ class LLMService {
               }, trying next... Error: ${error.message.substring(0, 100)}`
             );
             if (error.message.includes("context_length_exceeded")) {
+              const contextSize = typeof documentContent === 'string' ? documentContent.length : 'RAG vector store';
               console.warn(
-                `[WARNING] Context length exceeded for model ${model} with document size ${documentContent.length}`
+                `[WARNING] Context length exceeded for model ${model} with document context: ${contextSize}`
               );
             }
           }
@@ -539,15 +551,29 @@ class LLMService {
     return results;
   }
 
-  getEnhancedContext(question, documentContent) {
-    const MAX_CONTEXT_LENGTH = 120000;
-    if (documentContent.length > MAX_CONTEXT_LENGTH) {
-      console.warn(
-        `[WARNING] Document content (${documentContent.length} chars) exceeds MAX_CONTEXT_LENGTH (${MAX_CONTEXT_LENGTH} chars). Truncating.`
-      );
-      return documentContent.substring(0, MAX_CONTEXT_LENGTH);
+  async getEnhancedContext(question, documentContent, requestId = "unknown") {
+    // Check if documentContent is a vector store (RAG mode) or plain text (fallback mode)
+    if (typeof documentContent === 'string') {
+      // Fallback mode: direct text processing
+      const MAX_CONTEXT_LENGTH = 120000;
+      if (documentContent.length > MAX_CONTEXT_LENGTH) {
+        console.warn(
+          `[${requestId}] Document content (${documentContent.length} chars) exceeds MAX_CONTEXT_LENGTH (${MAX_CONTEXT_LENGTH} chars). Truncating.`
+        );
+        return documentContent.substring(0, MAX_CONTEXT_LENGTH);
+      }
+      return documentContent;
+    } else {
+      // RAG mode: use vector store for context retrieval
+      try {
+        console.log(`[${requestId}] Using RAG for enhanced context retrieval`);
+        const context = await this.ragService.getEnhancedContext(documentContent, question, 5, requestId);
+        return context;
+      } catch (error) {
+        console.error(`[${requestId}] RAG context retrieval failed: ${error.message}`);
+        throw new Error(`Failed to retrieve context using RAG: ${error.message}`);
+      }
     }
-    return documentContent;
   }
 
   buildPrompt(question, context) {

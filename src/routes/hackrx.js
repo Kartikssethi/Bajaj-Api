@@ -278,13 +278,13 @@ router.post("/run", upload.single("file"), async (req, res) => {
       .createHash("sha256")
       .update(processedText)
       .digest("hex");
-    const { store: documentContent, fromCache: contentCached } =
-      await llmService.createVectorStore(processedText, contentHash);
+    const { store: documentContent, fromCache: contentCached, fallback } =
+      await llmService.createVectorStore(processedText, contentHash, requestId);
     const contextPrepTime = Date.now() - startTime;
     console.log(
       `[${requestId}] Document content ${
         contentCached ? "loaded from cache" : "prepared"
-      } in ${contextPrepTime}ms (Bypass RAG)`
+      } in ${contextPrepTime}ms ${fallback ? "(Fallback mode)" : "(RAG mode)"}`
     );
 
     const answers = await llmService.answerQuestions(
